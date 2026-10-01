@@ -1,200 +1,200 @@
-# DataMedic AI — 1일차 작업 내역
+# DataMedic AI
 
-> **팀원:** 김홍민 (A)  
-> **범위:** T01 ~ T07 — 프로젝트 골격 · 데이터 모델 · 파서 · 규칙 엔진 · 검증 · 수정 · 내보내기
+> 여러 기관이 제출한 **Excel·JSON 업무 데이터**의 정합성을 자동으로 **진단 → 처방 → 승인 → 치료 → 재검진**하는 AI Agent
 
----
+LangGraph 기반 Agent와 Streamlit 화면으로 구성됩니다. 시·군이 제출한 사업 실적 엑셀을 취합하는 담당자가 형식 오류를 정리하는 시간을 줄이고, 폐업 후 지원·중복 수혜·이중 지급·한도 초과 같은 **부적정 지원 의심 건을 근거와 함께 조기 선별**하는 1차 방어선을 목표로 합니다. 부정수급 여부를 판정하지 않으며, 최종 판단은 담당자가 합니다.
 
-## 1. 1일차 목표 및 달성 현황
+## 주요 기능
 
-| ID | 작업 | 상태 |
-|---|---|---|
-| T01 | 프로젝트 골격, config, requirements, `.env.example` | ✅ 완료 |
-| T02 | `engine/models.py` — Pydantic 데이터 모델 전체 | ✅ 완료 |
-| T03 | 표준 서식 yaml, 코드표 csv, 샘플 20개 생성 스크립트 | ✅ 완료 |
-| T04 | `engine/parser.py` + `Dataset` | ✅ 완료 |
-| T05 | 규칙 base + format_rules (DATE_FORMAT, PHONE_FORMAT, TEXT_NORMALIZE) | ✅ 완료 |
-| T06 | value / row / table / json 규칙 (총 14종) | ✅ 완료 |
-| T07 | `validator`, `fixer`, `exporter`, `semantic.py`, `codebook.py` | ✅ 완료 |
+- **자동 진단** — 날짜·전화번호·사업자번호·금액·코드값 형식, 필수값 누락, 중복 행, 시트 간 합계 불일치, 이상치 등 14종 규칙 + 집계 규칙(중복 수혜·이중 지급·한도 초과)
+- **단계별 처방** — 오류마다 `auto`(자동) / `approval`(승인) / `request`(보완 요청) / `info`(참고)로 분류하고 수정안 제시
+- **사람 승인 흐름** — 애매한 수정은 그래프가 중단(interrupt)되어 담당자가 적용·거부·직접 수정을 선택
+- **변경 이력 추적** — 모든 수정은 셀 단위 `Change` 레코드로 기록
+- **재검진과 보완 요청** — 정제본에 같은 규칙을 다시 돌리고, 남은 오류는 기관별 보완 요청 메일로 생성
+- **자연어 목표·질문** — "한 기업이 받을 수 있는 게 5천만원인데 넘은 곳 있어?" 같은 질문을 규칙으로 번역해 실행하고, 필요하면 되물음
+- **표준 서식 자동 인식** — 표준 서식이 없는 파일은 LLM이 컬럼 의미를 추정
 
-**테스트 결과: 105개 통과 / 0개 실패**
+## 설계 원칙
+
+1. **LLM은 판단·설명만, 값의 검증·수정은 코드가 한다.** LLM 출력이 셀 값을 직접 바꾸는 경로는 없습니다.
+2. **원본 불변.** 입력 파일은 읽기만 하고 결과는 `outputs/<run_id>/`에 새로 씁니다.
+3. **모든 변경은 기록한다.** 기록 없이 값을 바꾸지 않습니다.
+4. **애매하면 사람 쪽으로.** 불확실하면 `auto`가 아니라 `approval`로 올립니다.
+5. **개인정보 보호.** LLM으로 보내는 샘플의 사업자번호·연락처·이메일은 마스킹합니다.
+
+## 동작 흐름
+
+```mermaid
+flowchart LR
+    U[업로드] --> S[structure<br/>파싱·컬럼 의미 인식]
+    S --> R[rules<br/>규칙 바인딩]
+    R --> D[diagnosis<br/>검증·진단서]
+    D --> P[prescription<br/>단계 분류·수정안]
+    P --> H{{approval<br/>사람 승인}}
+    H --> T[treatment<br/>수정 적용·이력]
+    T --> V[recheck<br/>재검진·리포트·보완 요청]
+    V --> O[outputs/run_id]
+```
+
+## 프로젝트 구조
 
 ```
-tests/test_models.py          16 passed
-tests/test_parser.py          11 passed
-tests/test_rules_format.py    27 passed
-tests/test_rules_value.py     21 passed
-tests/test_rules_row.py        7 passed
-tests/test_rules_table.py     10 passed
-tests/test_rules_json.py       6 passed
-tests/test_t07_integration.py  7 passed
-─────────────────────────────────────
-합계                          105 passed  in 1.33s
-```
-
----
-
-## 2. 구현 파일 목록
-
-```
-제4회 AI-SW/
-├── config.py                          # 경로·임계값·LLM 설정 (.env 로드)
-├── requirements.txt                   # 의존 패키지
-├── .env.example                       # 환경변수 템플릿
-│
-├── engine/
-│   ├── models.py                      # Pydantic 데이터 모델 전체
-│   ├── parser.py                      # xlsx/json → Dataset (모든 값 str)
-│   ├── semantic.py                    # 시맨틱 타입 → 기본 규칙 매핑
-│   ├── codebook.py                    # 코드표 로드 · 유사 코드 검색
-│   ├── validator.py                   # RuleBinding 실행 → Issue 목록
-│   ├── fixer.py                       # Decision 적용 → Dataset 수정 + Change 기록
-│   ├── exporter.py                    # 정제본·이력·리포트 파일 저장
-│   └── rules/
-│       ├── base.py                    # Rule 추상 클래스, REGISTRY
-│       ├── format_rules.py            # DATE_FORMAT, PHONE_FORMAT, TEXT_NORMALIZE
-│       ├── value_rules.py             # REQUIRED, DATE_RANGE, BIZNO_CHECKSUM,
-│       │                              #   CODE_VALID, NUMERIC_UNIT
-│       ├── row_rules.py               # DUPLICATE_ROW, NEAR_DUPLICATE
-│       ├── table_rules.py             # SUM_MATCH, OUTLIER, TYPE_CONSISTENCY
-│       └── json_rules.py             # JSON_SCHEMA
-│
+├── app.py            # Streamlit 화면 (업로드 / 진단서 / 처방전 / 결과)
+├── config.py         # 설정 (.env 로드)
+├── agent/            # LangGraph 그래프와 노드 (흐름 제어)
+├── engine/           # 파싱·규칙·검증·수정·이력 (순수 파이썬, LLM 모름)
+│   ├── rules/        #   규칙 구현
+│   └── tools/        #   외부 조회 도구 (국세청 사업자 상태 등)
+├── llm/              # LLM 클라이언트, 캐시, 프롬프트(prompts/*.md)
+├── notify/           # 보완 요청 메일 발송
+├── eval/             # 오류 주입·평가 스크립트
 ├── data/
-│   ├── standard/
-│   │   ├── performance.yaml           # 표준 서식 정의 (시군 사업실적)
-│   │   └── business_codes.csv         # 사업코드 코드표
-│   └── samples/
-│       ├── generate_samples.py        # 샘플 20개 생성 스크립트
-│       └── <시군명>_사업실적.xlsx      # 샘플 20개
-│
-└── tests/
-    ├── fixtures/                      # 테스트용 소형 xlsx/json
-    ├── test_models.py
-    ├── test_parser.py
-    ├── test_rules_format.py
-    ├── test_rules_value.py
-    ├── test_rules_row.py
-    ├── test_rules_table.py
-    ├── test_rules_json.py
-    └── test_t07_integration.py        # 통합 테스트 (validator → fixer → exporter)
+│   ├── standard/     # 표준 서식(yaml), 코드표·사업 기준표(csv)
+│   └── samples/      # 샘플 데이터 생성 스크립트
+├── tests/            # pytest 테스트 (실제 LLM 호출 없음)
+└── docs/             # 설계 문서
 ```
 
----
+계층은 `app.py → agent → engine / llm / notify` 방향으로만 의존하며, `engine/`은 `llm/`·`agent/`를 import하지 않습니다.
 
-## 3. 핵심 구현 설명
+## 시작하기
 
-### 3-1. 데이터 모델 (`engine/models.py`)
+### 요구 사항
 
-파이프라인 전체에서 공유하는 Pydantic v2 모델.
+- Python 3.11 이상
+- Anthropic 또는 OpenAI API 키 (진단 설명·컬럼 의미 추정에 사용)
 
-```python
-SemanticType = Literal["org_name", "biz_no", "date", "amount", "count",
-                        "phone", "email", "code", "text", "unknown"]
-Tier = Literal["auto", "approval", "request"]
-```
-
-| 모델 | 역할 |
-|---|---|
-| `CellRef` | 특정 셀 좌표 (파일·시트·행·컬럼) |
-| `Issue` | 발견된 오류 (`E-0001` 형식 ID) |
-| `Decision` | 이슈 처리 결정 (apply/reject/edit/request) |
-| `Change` | 적용된 변경 이력 (`C-0001` 형식 ID) |
-| `Dataset` | `(file, sheet) → DataFrame` (모든 값 str, `_row` 컬럼으로 원본 행 번호 유지) |
-
-### 3-2. 파서 (`engine/parser.py`)
-
-- xlsx: `dtype=str`로 전체 읽기, 엑셀 날짜 일련번호(40000~55000) → ISO 문자열 자동 변환
-- json: 배열/중첩 dict 모두 지원, `pd.json_normalize`
-- 공통: `_row` 컬럼 삽입 (헤더=1, 첫 데이터=2)
-
-### 3-3. 규칙 엔진 (`engine/rules/`)
-
-```python
-class Rule(ABC):
-    rule_id: ClassVar[str]
-    default_tier: ClassVar[Tier]
-    scope: ClassVar[Literal["cell", "row", "table", "cross_sheet"]]
-
-    def check(self, ds, binding, ctx) -> list[Issue]: ...
-    def fix(self, value, issue) -> str | None: ...  # 불가능하면 NotFixable
-```
-
-`@register` 데코레이터로 `REGISTRY`에 자동 등록, `validator.py`가 `run()`으로 일괄 실행.
-
-| rule_id | scope | tier | 설명 |
-|---|---|---|---|
-| DATE_FORMAT | cell | auto | ISO 외 날짜 → 자동 변환 |
-| PHONE_FORMAT | cell | auto | 하이픈 형식 통일 |
-| TEXT_NORMALIZE | cell | auto | 앞뒤 공백·전각 문자 제거 |
-| REQUIRED | cell | request | 필수값 공백 감지 |
-| DATE_RANGE | cell | request | 허용 범위 밖 날짜 |
-| BIZNO_CHECKSUM | cell | approval | 사업자번호 체크디지트 검증 |
-| CODE_VALID | cell | approval | 코드표 미등록 코드 |
-| NUMERIC_UNIT | cell | approval | 금액 단위 혼용 |
-| DUPLICATE_ROW | row | auto | 완전 동일 행 삭제 |
-| NEAR_DUPLICATE | row | approval | 핵심 컬럼 일치 유사 중복 |
-| SUM_MATCH | cross_sheet | request | 시트 간 합계 불일치 |
-| OUTLIER | table | request | IQR 기반 이상치 |
-| TYPE_CONSISTENCY | cell | approval | 컬럼 다수 타입과 다른 값 |
-| JSON_SCHEMA | cell | approval | jsonschema 위반 |
-
-### 3-4. 검증·수정·내보내기
-
-```
-validator.run(ds, bindings)          # Issue 목록 반환
-  └─ fixer.apply(ds, issues, decisions)  # cleaned Dataset + Change 목록
-        └─ exporter.save_*(...)           # outputs/<run_id>/ 저장
-```
-
-`fixer.py`는 유일하게 `Dataset.set_cell()` / `drop_row()`를 호출하는 모듈 — LLM이 셀 값을 직접 바꾸는 경로 없음.
-
----
-
-## 4. 표준 서식 (`data/standard/performance.yaml`)
-
-경남 시군 사업실적 서식 기준:
-
-```yaml
-sheets:
-  실적:
-    columns:
-      - {name: 기관명,       type: org_name, required: true}
-      - {name: 사업코드,     type: code,     required: true, codebook: business_codes.csv}
-      - {name: 지원일자,     type: date,     required: true, range: [2026-01-01, 2026-12-31]}
-      - {name: 지원금액,     type: amount,   required: true, unit: 원}
-      ...
-  요약:
-    ...
-relations:
-  - {rule: SUM_MATCH, source: 실적.지원금액, group_by: 사업코드, agg: sum, target: 요약.지원금액합계}
-```
-
----
-
-## 5. 실행 방법
+### 설치
 
 ```bash
-# 가상환경 생성 및 패키지 설치
+git clone <저장소 주소>
+cd <저장소 폴더>
+
 python -m venv .venv
-.venv\Scripts\activate          # Windows
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-# 테스트 실행
-pytest tests/test_models.py tests/test_parser.py tests/test_rules_format.py \
-       tests/test_rules_value.py tests/test_rules_row.py tests/test_rules_table.py \
-       tests/test_rules_json.py tests/test_t07_integration.py -v
+cp .env.example .env             # 본인의 API 키를 채워 넣습니다
+```
 
-# 샘플 생성 (선택)
+### 환경 변수 (`.env`)
+
+| 변수 | 설명 | 기본값 |
+|---|---|---|
+| `LLM_PROVIDER` | `claude` 또는 `openai` | `claude` |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | LLM API 키 | - |
+| `LLM_MODEL_CLAUDE` / `LLM_MODEL_OPENAI` | 모델명 | - |
+| `ODCLOUD_API_KEY` | 공공데이터포털 국세청 사업자 상태 조회 키 (선택) | - |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` | 보완 요청 메일 발송 설정 | `smtp.gmail.com` / `587` |
+| `MAIL_DRY_RUN` | `true`면 메일을 보내지 않고 파일로만 저장 | `true` |
+| `DISABLED_RULES` | 끌 규칙 ID를 쉼표로 구분 | 없음 |
+
+> `.env`에는 비밀 값이 들어 있으므로 **절대 커밋하지 않습니다.** (`.gitignore`에 포함)
+
+## 사용법
+
+### 샘플 데이터 만들기
+
+저장소에는 샘플 파일이 포함되어 있지 않습니다. 스크립트로 가상 데이터를 생성합니다.
+
+```bash
 python data/samples/generate_samples.py
 ```
 
----
+### 웹 화면
 
-## 6. 2일차 예정 작업
+```bash
+streamlit run app.py
+```
 
-| ID | 작업 |
+1. **업로드** — 파일을 올리고 진단 시작
+2. **진단서** — 오류 요약, 규칙별 건수, 파일별 오류 표 (필터·페이지네이션)
+3. **처방전** — 승인이 필요한 항목을 적용 / 거부 / 직접 수정
+4. **결과** — 재검진 결과, 변경 이력, 보완 요청 메일 편집·발송, 결과 다운로드
+
+### CLI
+
+```bash
+python -m agent.graph --inputs "data/samples/*.xlsx" --auto-approve
+```
+
+`--auto-approve`는 승인 대기 항목을 모두 적용합니다.
+
+## 출력물
+
+실행 결과는 `outputs/<run_id>/`(`YYYYMMDD-HHMMSS`)에 저장됩니다.
+
+```
+cleaned/<원본파일명>          # 정제본 (원본과 같은 형식)
+highlighted/<원본파일명>      # 오류 셀(빨강)·수정 셀(초록) 하이라이트
+changelog.csv                 # 셀 단위 변경 이력
+issues.csv                    # 전체 오류 목록
+diagnosis_report.md / .xlsx   # 진단 리포트
+requests/<기관명>.json        # 보완 요청 메일
+report.json                   # 실행 요약
+```
+
+## 검증 규칙
+
+| 규칙 | 설명 | 기본 처리 |
+|---|---|---|
+| `TYPE_CONSISTENCY` | 컬럼 다수 타입과 다른 값 | 승인 |
+| `REQUIRED` | 필수값 공백 | 보완 요청 |
+| `DATE_FORMAT` | ISO 외 날짜 표기 | 자동 |
+| `DATE_RANGE` | 범위 밖 일자 | 보완 요청 |
+| `BIZNO_CHECKSUM` | 사업자번호 자릿수·체크디지트 | 승인 |
+| `PHONE_FORMAT` | 전화번호 하이픈 형식 | 자동 |
+| `TEXT_NORMALIZE` | 공백·전각·㈜ 표기 정규화 | 자동 |
+| `CODE_VALID` | 코드표에 없는 값 (최근접 코드 제안) | 승인 |
+| `NUMERIC_UNIT` | `,`·`원`·`천원` 혼용 | 자동/승인 |
+| `DUPLICATE_ROW` | 완전 동일 행 | 승인 |
+| `NEAR_DUPLICATE` | 핵심 컬럼 일치·나머지 유사 | 승인 |
+| `SUM_MATCH` | 그룹 합계와 요약값 불일치 | 보완 요청 |
+| `OUTLIER` | IQR 이탈 또는 평균 대비 5배 초과 | 보완 요청 |
+| `JSON_SCHEMA` | JSON 스키마 위반 | 승인 |
+
+집계 규칙(중복 수혜, 이중 지급 의심, 한도 초과)과 상세 명세는 [`RULES.md`](RULES.md)를 참고하세요.
+
+새 규칙 추가: `engine/rules/`에 클래스 작성 → `@register` → `engine/semantic.py` 매핑 추가 → `tests/`에 정상·오류 케이스 각 2개 이상.
+
+## 테스트
+
+```bash
+pytest -q
+pytest --cov                   # 커버리지
+```
+
+테스트에서는 실제 LLM API를 호출하지 않고 `FakeLLM`을 사용합니다.
+
+## 평가
+
+오류를 주입한 테스트셋으로 검출률과 수정 정확도를 측정합니다.
+
+```bash
+python eval/inject_errors.py --src data/samples --out data/testset --seed 42
+python eval/evaluate.py --testset data/testset --run outputs/<run_id>
+```
+
+| 지표 | 목표 |
 |---|---|
-| T08 | `eval/inject_errors.py`, `evaluate.py` |
-| T09 | `llm/client.py` + 프롬프트 4종 |
-| T10 | `agent/` LangGraph 그래프 6개 노드 |
-| T11 | `app.py` Streamlit 4개 탭 |
+| 규칙형 오류 검출률 | 95% 이상 |
+| 이상치형 오류 검출률 | 70% 이상 |
+| 자동 수정 오수정률 | 3% 이하 |
+| 수정안 적중률 | 80% 이상 |
+| 자동 처리율 | 60% 이상 |
+
+## 기술 스택
+
+Python 3.11 · LangGraph · Streamlit · pandas · openpyxl · pydantic v2 · rapidfuzz · jsonschema · Anthropic / OpenAI API
+
+## 문서
+
+- [`docs/DESIGN.md`](docs/DESIGN.md) — 전체 설계 문서 (데이터 모델, 노드 명세, 작업 목록)
+- [`RULES.md`](RULES.md) — 탐지 규칙 상세 명세
+- [`docs/planner_design.md`](docs/planner_design.md) — 목표 해석(Plan) 범위 가드 설계
+- [`ODCLOUD.md`](ODCLOUD.md) — 국세청 사업자 상태 조회 연동
+- [`REACT_AGENT_DESIGN.md`](REACT_AGENT_DESIGN.md) — ReAct 방식 Agent 설계
+
+## 데이터와 개인정보
+
+저장소에는 **개인정보가 포함된 샘플·테스트셋·산출물을 올리지 않습니다.** 샘플은 `generate_samples.py`로 만든 가상 데이터이며, 기관 주소록은 `data/standard/org_contacts.example.csv` 형식을 참고해 직접 작성합니다.

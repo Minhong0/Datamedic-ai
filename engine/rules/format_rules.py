@@ -23,11 +23,16 @@ def _iter_column(ds: Dataset, target: str):
 
 _DATE_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"^(\d{4})-(\d{2})-(\d{2})$"), "iso"),
+    (re.compile(r"^(\d{4})-(\d{2})-(\d{2})[ T]\d{2}:\d{2}(:\d{2})?.*$"), "iso_with_time"),
     (re.compile(r"^(\d{4})(\d{2})(\d{2})$"), "compact"),
     (re.compile(r"^(\d{4})\.(\d{2})\.(\d{2})$"), "dot"),
     (re.compile(r"^(\d{4})/(\d{2})/(\d{2})$"), "slash"),
+    # M/D/YYYY 형식 (한국 실무에서 자주 발생하는 오류)
+    (re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4})$"), "mdy"),
     (re.compile(r"^(\d{2})[-./](\d{2})[-./](\d{2})$"), "ambiguous"),
 ]
+
+_SKIP_VALUES = {"nan", "none", "nat", "null", "", "-", "n/a"}
 
 
 def _try_parse_date(value: str) -> tuple[date | None, bool]:
@@ -39,6 +44,14 @@ def _try_parse_date(value: str) -> tuple[date | None, bool]:
             continue
         if fmt == "ambiguous":
             return None, True
+        if fmt == "mdy":
+            # M/D/YYYY → month=group1, day=group2, year=group3
+            mo, d, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            try:
+                return date(y, mo, d), False
+            except ValueError:
+                continue
+        # iso, iso_with_time, compact, dot, slash → group1=year, group2=month, group3=day
         y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
         try:
             return date(y, mo, d), False
@@ -61,7 +74,7 @@ class DateFormatRule(Rule):
             for file, sheet, df, column in _iter_column(ds, target):
                 for _, row in df.iterrows():
                     val = str(row[column])
-                    if not val or val.strip() == "":
+                    if val.strip().lower() in _SKIP_VALUES:
                         continue
                     parsed, ambiguous = _try_parse_date(val)
                     ref = CellRef(file=file, sheet=sheet, row=int(row["_row"]), column=column)
@@ -80,10 +93,15 @@ class DateFormatRule(Rule):
                             tier="approval",
                         ))
                     elif val.strip() != parsed.isoformat():
+                        # 시간 정보가 포함된 경우 메시지를 구체적으로 표시
+                        if " " in val.strip() or "T" in val.strip():
+                            msg = f"날짜에 시간 정보가 포함되어 있습니다 (날짜만 필요): '{val}'"
+                        else:
+                            msg = f"날짜가 ISO 형식(YYYY-MM-DD)이 아닙니다: '{val}'"
                         issues.append(Issue(
                             issue_id=ctx.next_issue_id(), ref=ref,
                             rule_id=self.rule_id, kind="rule", value=val,
-                            message=f"날짜가 ISO 형식(YYYY-MM-DD)이 아닙니다: '{val}'",
+                            message=msg,
                             tier="auto",
                             suggestion=parsed.isoformat(),
                         ))

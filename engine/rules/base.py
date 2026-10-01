@@ -12,6 +12,18 @@ class NotFixable(Exception):
 
 
 @dataclass
+class NormResult:
+    """정규화 함수의 표준 반환형 (RULES.md 0절 4항).
+
+    value=None 이면 정규화 실패.
+    certain=True → auto tier, False → approval tier.
+    """
+    value: str | None
+    certain: bool
+    reason: str
+
+
+@dataclass
 class RuleContext:
     """규칙 실행 시 공유 컨텍스트."""
     issue_counter: list[int] = field(default_factory=lambda: [0])

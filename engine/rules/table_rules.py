@@ -129,7 +129,7 @@ class SumMatchRule(Rule):
 @register
 class OutlierRule(Rule):
     rule_id = "OUTLIER"
-    default_tier = "request"
+    default_tier = "info"
     scope = "table"
     kind = "outlier"  # type: ignore[assignment]
 
@@ -160,13 +160,24 @@ class OutlierRule(Rule):
                         continue
                     row_num = int(df.loc[idx, "_row"])
                     raw = str(df.loc[idx, column])
-                    if not (lo <= val <= hi) or (mean_val > 0 and val > mean_val * org_factor):
+                    iqr_out = not (lo <= val <= hi)
+                    org_out = mean_val > 0 and val > mean_val * org_factor
+                    if iqr_out or org_out:
+                        if org_out and val > hi:
+                            msg = (f"[참고] 이상값 후보 (IQR 기준): {int(val):,} "
+                                   f"— 평균 대비 {val/mean_val:.1f}배 (평균 {int(mean_val):,})")
+                        elif val < lo:
+                            msg = (f"[참고] 이상값 후보 (IQR 기준): {int(val):,} "
+                                   f"— 분포 하단 (IQR 범위 {lo:,.0f} ~ {hi:,.0f})")
+                        else:
+                            msg = (f"[참고] 이상값 후보 (IQR 기준): {int(val):,} "
+                                   f"— 분포 상단 (IQR 범위 {lo:,.0f} ~ {hi:,.0f})")
                         issues.append(Issue(
                             issue_id=ctx.next_issue_id(),
                             ref=CellRef(file=file, sheet=s, row=row_num, column=column),
                             rule_id=self.rule_id, kind="outlier",
                             value=raw,
-                            message=f"이상값 감지: {raw} (IQR 범위 {lo:.0f}~{hi:.0f})",
-                            tier="request",
+                            message=msg,
+                            tier="info",
                         ))
         return issues
