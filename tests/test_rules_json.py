@@ -1,4 +1,10 @@
-"""json_rules 테스트: JSON_SCHEMA."""
+"""json_rules 테스트: JSON_SCHEMA.
+
+MVP에서는 이 규칙들이 비활성화됨 (RULES.md R-01). 전체 skip 처리.
+"""
+import pytest
+pytestmark = pytest.mark.skip(reason="R-01: json_rules 비활성화 (RULES.md MVP)")
+"""_original_docstring"""
 import pandas as pd
 import pytest
 

@@ -6,14 +6,18 @@ from typing import Literal
 import pandas as pd
 from pydantic import BaseModel, field_validator
 
+# 집계 규칙 템플릿 (R5~R7)
+Template = Literal["MAX_COUNT", "NEAR_DUPLICATE", "SUM_LIMIT"]
+Period = Literal["year", "all", "business_period"]
+
 
 # 컬럼의 의미론적 분류 (LLM 또는 표준 정의에서 부여)
 SemanticType = Literal[
     "org_name", "biz_no", "date", "amount", "count",
     "phone", "email", "code", "text", "unknown"
 ]
-# 오류 처리 등급: auto=자동수정, approval=사람 승인 필요, request=원본 제공처에 요청
-Tier = Literal["auto", "approval", "request"]
+# 오류 처리 등급: auto=자동수정, approval=사람 승인 필요, request=원본 제공처에 요청, info=참고 정보(처리 없음)
+Tier = Literal["auto", "approval", "request", "info"]
 ErrorKind = Literal["rule", "outlier"]
 
 
@@ -100,6 +104,25 @@ class RequestItem(BaseModel):
     sent: bool = False
 
 
+# 목표(goal)를 해석한 실행 계획의 한 단계 (plan 노드가 생성)
+class PlanStep(BaseModel):
+    capability: str                                       # engine/planning.py 카탈로그 ID
+    label: str
+    status: Literal["run", "dependency", "skipped"]       # 실행 / 선행 작업 자동 추가 / 생략
+    reason: str
+
+
+# 목표 → 실행 계획. rule 범위 가드의 유일한 기준 (docs/planner_design.md)
+class Plan(BaseModel):
+    goal: str
+    status: Literal["ready", "needs_clarification"]
+    steps: list[PlanStep] = []
+    question: str | None = None                           # needs_clarification 일 때 되묻는 말
+    options: list[dict] = []                              # [{"id": capability, "label": str}]
+    delete_intent: bool = False                           # 목표에 제거·삭제 의도가 있는지
+    source: Literal["llm", "keyword", "full", "user"] = "keyword"
+
+
 # 한 번의 실행 전체 요약 (recheck 노드가 생성)
 class RunReport(BaseModel):
     run_id: str
@@ -108,6 +131,30 @@ class RunReport(BaseModel):
     tier_counts: dict[str, int]     # tier → 건수
     recheck_passed: bool
     remaining_issues: list[str]
+
+
+class RuleSpec(BaseModel):
+    """집계 규칙 명세 (R5~R7). 템플릿 3종 + 파라미터로만 표현한다."""
+
+    spec_id: str                              # "RS-0001"
+    template: Template
+    description: str                          # 사람이 읽는 한 줄 설명
+    group_by: list[str]                       # 표준 컬럼명만 허용
+    params: dict                              # 템플릿별 파라미터
+    period: Period = "year"
+    filter_business: str | None = None        # 특정 사업명으로 한정
+    tier: Tier = "approval"                   # 템플릿 기본값
+    source: Literal["business_master", "user_query"] = "business_master"
+    confirmed_by: str | None = None
+
+
+class GroupIssue(Issue):
+    """집계 규칙(R5~R7)이 생성하는 행 묶음 단위 Issue."""
+
+    group_key: dict[str, str]                 # {"사업자번호": "1234567890", ...}
+    rows: list[CellRef]                       # 근거 행 목록
+    metric: str                               # "사업 2건 (허용 1건)" 등
+    spec_id: str
 
 
 class Dataset:

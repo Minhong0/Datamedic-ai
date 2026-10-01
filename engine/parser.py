@@ -85,6 +85,8 @@ def load_files(paths: list[str | Path]) -> Dataset:
     tables: dict[tuple[str, str], pd.DataFrame] = {}
     for p in paths:
         path = Path(p)
+        if path.name.startswith("~$"):   # Excel 잠금 파일 무시
+            continue
         if not path.exists():
             raise FileNotFoundError(path)
         ext = path.suffix.lower()

@@ -43,6 +43,8 @@ def save_cleaned(ds: Dataset, run_dir: Path) -> None:
 
 
 def save_changelog(changes: list[Change], run_dir: Path) -> None:
+    from engine.masking import mask_changes
+    changes = mask_changes(changes)   # 사업자번호 표시 마스킹 (RULES.md 0절 6항)
     path = run_dir / "changelog.csv"
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=[
@@ -67,6 +69,8 @@ def save_changelog(changes: list[Change], run_dir: Path) -> None:
 
 
 def save_issues(issues: list[Issue], run_dir: Path) -> None:
+    from engine.masking import mask_issues
+    issues = mask_issues(issues)
     path = run_dir / "issues.csv"
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=[
@@ -193,6 +197,9 @@ def save_diagnosis_xlsx(issues: list[Issue], run_dir: Path) -> None:
       - 전체목록: 모든 Issue 행 단위 상세
       - 파일별 시트: 각 파일의 Issue만 모아서 표시
     """
+    from engine.masking import mask_issues
+    issues = mask_issues(issues)
+
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
 

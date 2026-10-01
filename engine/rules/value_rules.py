@@ -29,7 +29,7 @@ class RequiredRule(Rule):
                             issue_id=ctx.next_issue_id(),
                             ref=CellRef(file=file, sheet=sheet, row=int(row["_row"]), column=column),
                             rule_id=self.rule_id, kind="rule",
-                            value=None,
+                            value="(공백)",
                             message=f"필수 항목이 비어 있습니다: '{column}'",
                             tier="request",
                         ))
@@ -120,10 +120,20 @@ class BiznoChecksumRule(Rule):
                     digits = _bizno_digits(val)
                     ref = CellRef(file=file, sheet=sheet, row=int(row["_row"]), column=column)
                     if not _bizno_valid(digits):
+                        # API 키가 있으면 국세청 2차 확인
+                        api_note = ""
+                        try:
+                            from config import settings as _s
+                            from engine.tools.bizno_api import lookup
+                            status = lookup(val, _s.odcloud_api_key)
+                            if status:
+                                api_note = f" [국세청: {status['status']}]"
+                        except Exception:
+                            pass
                         issues.append(Issue(
                             issue_id=ctx.next_issue_id(), ref=ref,
                             rule_id=self.rule_id, kind="rule", value=val,
-                            message=f"사업자번호 체크디지트가 맞지 않습니다: '{val}'",
+                            message=f"사업자번호 체크디지트가 맞지 않습니다: '{val}'{api_note}",
                             tier="approval",
                         ))
                     else:
@@ -181,22 +191,67 @@ class CodeValidRule(Rule):
 
 # ── NUMERIC_UNIT ──────────────────────────────────────────────────────────────
 
-_STRIP_PATTERN = re.compile(r"[,원천원]")
-_UNIT_PATTERN = re.compile(r"(천원|만원|억원|원)")
+_VALID_COMMA_NUM = re.compile(r"^-?\d{1,3}(,\d{3})*(\.\d+)?$")
+# 스케일 단위: 긴 것부터 매칭해야 '억원'이 '원'보다 먼저 처리됨
+_SCALE_UNITS: list[tuple[str, int]] = [
+    ("억원", 100_000_000),
+    ("만원", 10_000),
+    ("천원", 1_000),
+]
 
 
-def _numeric_clean(value: str) -> tuple[str | None, bool]:
-    """(정제된 숫자 문자열, 단위 환산 필요 여부). 파싱 불가면 None."""
+def _numeric_clean(value: str) -> tuple[str | None, str | None]:
+    """(단위 제거 숫자 문자열, 제안값). 파싱 불가면 (None, None).
+
+    - '원' 접미사만 있는 경우: 그대로 제거 → suggestion=cleaned
+    - '만원'/'천원'/'억원': 스케일 곱셈으로 변환 → suggestion=변환값
+    """
     v = value.strip()
-    needs_conversion = bool(_UNIT_PATTERN.search(v))
-    cleaned = re.sub(r"[,원]", "", v)
-    cleaned = cleaned.replace("천", "").replace("만", "").replace("억", "")
+
+    scale = 1
+    for unit, mult in _SCALE_UNITS:
+        if unit in v:
+            scale = mult
+            break
+
+    cleaned = v.replace("억원", "").replace("만원", "").replace("천원", "").replace("원", "")
+    cleaned = cleaned.replace(",", "").replace("억", "").replace("만", "").replace("천", "")
     cleaned = cleaned.strip()
+
     try:
-        float(cleaned)
-        return cleaned, needs_conversion
+        num = float(cleaned)
     except ValueError:
-        return None, False
+        return None, None
+
+    converted = int(num * scale)
+    return cleaned, str(converted)
+
+
+def _majority_format(df: "pd.DataFrame", column: str) -> str:
+    """컬럼 내 순수 숫자 값의 다수 포맷을 반환: 'comma' 또는 'plain'."""
+    comma, plain = 0, 0
+    for v in df[column]:
+        s = str(v).strip()
+        if not s:
+            continue
+        try:
+            float(s.replace(",", ""))
+        except ValueError:
+            continue
+        if "," in s:
+            comma += 1
+        else:
+            plain += 1
+    return "comma" if comma > plain else "plain"
+
+
+def _add_commas(value: str) -> str:
+    """순수 숫자 문자열에 천 단위 쉼표를 추가한다."""
+    try:
+        n = float(value)
+        return f"{n:,.0f}" if n == int(n) else f"{n:,}"
+    except ValueError:
+        return value
 
 
 @register
@@ -206,49 +261,78 @@ class NumericUnitRule(Rule):
     scope = "cell"
 
     def check(self, ds: Dataset, binding: RuleBinding, ctx: RuleContext) -> list[Issue]:
+        import pandas as _pd
         issues: list[Issue] = []
         for target in binding.targets:
             for file, sheet, df, column in _iter_column(ds, target):
+                # 표준(performance.yaml)에 unit이 '원'으로 선언된 컬럼은
+                # 목표 표기가 '순수 정수'다 → 쉼표·단위를 항상 오류로 본다(다수결 미적용).
+                # unit 미지정 컬럼만 컬럼 내 다수 포맷을 표준으로 삼는다(하위호환).
+                plain_target = binding.params.get("unit") == "원"
+                fmt_std = "plain" if plain_target else _majority_format(df, column)
                 for _, row in df.iterrows():
                     val = str(row[column]).strip()
                     if not val:
                         continue
-                    # 숫자만 있으면 정상
+                    # 순수 숫자 (쉼표 포함/불포함)
                     try:
                         float(val.replace(",", ""))
-                        # 쉼표 포함 → auto 제거
                         if "," in val:
-                            cleaned = val.replace(",", "")
-                            issues.append(Issue(
-                                issue_id=ctx.next_issue_id(),
-                                ref=CellRef(file=file, sheet=sheet, row=int(row["_row"]), column=column),
-                                rule_id=self.rule_id, kind="rule", value=val,
-                                message=f"숫자에 쉼표 구분자가 있습니다: '{val}'",
-                                tier="auto",
-                                suggestion=cleaned,
-                            ))
+                            # 쉼표 위치가 올바른 패턴인지 검증 (예: 1,000,00 → 잘못됨)
+                            if not _VALID_COMMA_NUM.match(val.strip()):
+                                issues.append(Issue(
+                                    issue_id=ctx.next_issue_id(),
+                                    ref=CellRef(file=file, sheet=sheet, row=int(row["_row"]), column=column),
+                                    rule_id=self.rule_id, kind="rule", value=val,
+                                    message=f"숫자의 쉼표 위치가 올바르지 않습니다: '{val}'",
+                                    tier="auto",
+                                    suggestion=(val.replace(",", "") if plain_target
+                                                else _add_commas(val.replace(",", ""))),
+                                ))
+                            elif fmt_std == "plain":
+                                # 표준이 순수 정수(unit=원) 또는 다수가 쉼표 없는 포맷 → 쉼표 제거
+                                issues.append(Issue(
+                                    issue_id=ctx.next_issue_id(),
+                                    ref=CellRef(file=file, sheet=sheet, row=int(row["_row"]), column=column),
+                                    rule_id=self.rule_id, kind="rule", value=val,
+                                    message=f"숫자에 쉼표 구분자가 있습니다: '{val}'",
+                                    tier="auto",
+                                    suggestion=val.replace(",", ""),
+                                ))
+                            # else: 다수가 쉼표 포맷 → 이 값은 정상
+                        else:
+                            if fmt_std == "comma":
+                                # 다수가 쉼표 포맷 → 쉼표 없는 값이 비표준
+                                issues.append(Issue(
+                                    issue_id=ctx.next_issue_id(),
+                                    ref=CellRef(file=file, sheet=sheet, row=int(row["_row"]), column=column),
+                                    rule_id=self.rule_id, kind="rule", value=val,
+                                    message=f"금액 표기가 일관되지 않습니다 (이 컬럼 표준: 쉼표 포맷): '{val}'",
+                                    tier="auto",
+                                    suggestion=_add_commas(val),
+                                ))
+                            # else: 표준이 순수 정수이거나 다수가 plain → 정상
                         continue
                     except ValueError:
                         pass
 
-                    cleaned, needs_conv = _numeric_clean(val)
+                    cleaned, suggestion = _numeric_clean(val)
                     if cleaned is None:
                         continue
-                    tier: str = "approval" if needs_conv else "auto"
                     issues.append(Issue(
                         issue_id=ctx.next_issue_id(),
                         ref=CellRef(file=file, sheet=sheet, row=int(row["_row"]), column=column),
                         rule_id=self.rule_id, kind="rule", value=val,
                         message=f"숫자 형식에 단위/기호가 섞여 있습니다: '{val}'",
-                        tier=tier,
-                        suggestion=cleaned if not needs_conv else None,
+                        tier="auto",
+                        suggestion=suggestion,
                     ))
         return issues
 
     def fix(self, value: str | None, issue: Issue) -> str | None:
         if not value:
             raise NotFixable
-        cleaned, needs_conv = _numeric_clean(value)
-        if cleaned is None or needs_conv:
+        _, suggestion = _numeric_clean(value)
+        if suggestion is None:
             raise NotFixable
-        return cleaned
+        return suggestion

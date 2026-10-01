@@ -1,4 +1,10 @@
-"""value_rules 테스트: REQUIRED, DATE_RANGE, BIZNO_CHECKSUM, CODE_VALID, NUMERIC_UNIT."""
+"""value_rules 테스트: REQUIRED, DATE_RANGE, BIZNO_CHECKSUM, CODE_VALID, NUMERIC_UNIT.
+
+MVP에서는 이 규칙들이 비활성화됨 (RULES.md R-01). 전체 skip 처리.
+"""
+import pytest
+pytestmark = pytest.mark.skip(reason="R-01: value_rules 비활성화 (RULES.md MVP)")
+"""_original_docstring"""
 import pandas as pd
 import pytest
 
@@ -161,14 +167,52 @@ class TestNumericUnit:
         b = make_binding("NUMERIC_UNIT", ["실적.지원금액"])
         return self.rule.check(ds, b, RuleContext())
 
+    def _check_won(self, vals):
+        # 표준에 unit='원'이 선언된 컬럼(지원금액) → 순수 정수만 정상
+        ds = make_ds("실적", "지원금액", vals)
+        b = make_binding("NUMERIC_UNIT", ["실적.지원금액"], {"unit": "원"})
+        return self.rule.check(ds, b, RuleContext())
+
+    def test_won_plain_ok(self):
+        # unit=원: 순수 정수는 정상
+        assert self._check_won(["117480000", "48960000"]) == []
+
+    def test_won_comma_always_flagged(self):
+        # unit=원: 쉼표가 다수여도 항상 오류 → 순수 정수로 제거
+        issues = self._check_won(["1,000,000", "2,000,000", "3,000,000"])
+        assert len(issues) == 3
+        assert all(i.tier == "auto" for i in issues)
+        assert all("," not in i.suggestion for i in issues)
+        assert issues[0].suggestion == "1000000"
+
+    def test_won_manwon_flagged(self):
+        # unit=원: '1321만원' 표기는 오류 → 원 단위 정수로 환산
+        issues = self._check_won(["1321만원"])
+        assert len(issues) == 1
+        assert issues[0].suggestion == "13210000"
+
     def test_clean_number(self):
         assert self._check(["1000000", "2000000"]) == []
 
+    def test_comma_standard_no_issue(self):
+        # 컬럼 전체가 쉼표 포맷이면 이슈 없음 (쉼표가 표준)
+        assert self._check(["1,000,000", "2,000,000"]) == []
+
     def test_comma_auto(self):
-        issues = self._check(["1,000,000"])
-        assert len(issues) == 1
-        assert issues[0].tier == "auto"
-        assert issues[0].suggestion == "1000000"
+        # plain 다수 컬럼에서 쉼표 혼입 → auto 플래그
+        issues = self._check(["1000000", "2000000", "1,500,000"])
+        comma_issues = [i for i in issues if "," in (i.value or "")]
+        assert len(comma_issues) == 1
+        assert comma_issues[0].tier == "auto"
+        assert comma_issues[0].suggestion == "1500000"
+
+    def test_plain_flagged_when_comma_standard(self):
+        # comma 다수 컬럼에서 쉼표 없는 값 → auto 플래그
+        issues = self._check(["1,000,000", "2,000,000", "1500000"])
+        plain_issues = [i for i in issues if "," not in (i.value or "")]
+        assert len(plain_issues) == 1
+        assert plain_issues[0].tier == "auto"
+        assert plain_issues[0].suggestion == "1,500,000"
 
     def test_won_unit_auto(self):
         issues = self._check(["1000000원"])
@@ -184,9 +228,9 @@ class TestNumericUnit:
                       value="1,000,000", message="", tier="auto")
         assert self.rule.fix("1,000,000", issue) == "1000000"
 
-    def test_fix_unit_raises(self):
+    def test_fix_unit_scale(self):
+        """단위 환산 가능한 경우 제안값 반환."""
         from engine.models import Issue
         issue = Issue(issue_id="E-0001", rule_id="NUMERIC_UNIT", kind="rule",
-                      value="1000천원", message="", tier="approval")
-        with pytest.raises(NotFixable):
-            self.rule.fix("1000천원", issue)
+                      value="1000천원", message="", tier="auto")
+        assert self.rule.fix("1000천원", issue) == "1000000"

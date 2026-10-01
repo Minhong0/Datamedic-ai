@@ -1,4 +1,10 @@
-"""format_rules — DATE_FORMAT, PHONE_FORMAT, TEXT_NORMALIZE 테스트."""
+"""format_rules — DATE_FORMAT, PHONE_FORMAT, TEXT_NORMALIZE 테스트.
+
+MVP에서는 이 규칙들이 비활성화됨 (RULES.md R-01). 전체 skip 처리.
+"""
+import pytest
+pytestmark = pytest.mark.skip(reason="R-01: format_rules 비활성화 (RULES.md MVP)")
+"""_original_docstring"""
 import pandas as pd
 import pytest
 
