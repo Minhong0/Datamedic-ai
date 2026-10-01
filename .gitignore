@@ -1,0 +1,29 @@
+# 비밀 정보
+.env
+.env.*
+!.env.example
+
+# 개인정보 가능성 있는 데이터·산출물
+outputs/
+data/testset/
+data/standard/org_contacts.csv
+# 엑셀은 익명화한 샘플(data/samples)만 올린다
+*.xlsx
+!data/samples/*.xlsx
+~$*
+*.csv
+!data/standard/business_codes.csv
+!data/standard/business_master.csv
+
+# 기타
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+.venv/
+.venv*/
+*.egg-info/
+dist/
+build/
+*.png
+.claude/
