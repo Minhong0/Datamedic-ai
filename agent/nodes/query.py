@@ -1,4 +1,4 @@
-"""8장 자연어 질문 → 집계 규칙 서브그래프 노드.
+"""자연어 질문 → 집계 규칙 서브그래프 노드.
 
 흐름:
   query_input → translate(LLM) → validate(code)
@@ -21,6 +21,7 @@ from pydantic import BaseModel
 
 from config import settings
 from engine.models import Dataset, GroupIssue, Period, RuleSpec, Template
+from engine.planning import AGGREGATE_TEMPLATES
 from engine.rules.aggregate import (
     STANDARD_COLUMNS,
     _next_spec_id,
@@ -37,13 +38,18 @@ logger = logging.getLogger(__name__)
 _MEMORY_FILE = settings.data_dir / "memory" / "rules.json"
 _MASTER_FILE = settings.standard_dir / "business_master.csv"
 
-MAX_CLARIFY_ROUNDS = 2
+MAX_CLARIFY_ROUNDS = 4   # 복합 목표는 되물을 슬롯이 여러 개일 수 있다
 
 
 # ── 상태 ──────────────────────────────────────────────────────────────────────
 
 class QueryState(TypedDict, total=False):
     query_text: str                      # 사용자 원문 질문
+    template_hint: str                   # 계획이 정한 집계 템플릿 (복합 목표를 검사별로 나눠 번역)
+    business_names: list[str]            # 집계 대상 파일의 사업명 (되묻기 선택지·사업 한정 판단용)
+    answers: list                        # 사용자가 되묻기·수정에 한 답 [(슬롯 또는 "*", 문장)] — LLM·키워드 해석보다 우선한다
+    slot_tries: dict                     # 슬롯별로 물어본 횟수 — 같은 질문을 되풀이하지 않기 위한 기록
+    defaults_used: list                  # 읽지 못해 기본값으로 채운 슬롯 이름 (확인 카드에 표시)
     clarify_count: int                   # 되묻기 횟수 (최대 MAX_CLARIFY_ROUNDS)
     translation: dict                    # LLM 번역 결과 (TranslationResponse.model_dump())
     missing_slots: list[str]             # 미충족 필수 슬롯 이름
@@ -68,6 +74,9 @@ class TranslationResponse(BaseModel):
     filter_business: str | None = None
     missing_slots: list[str] = []
     description: str = ""
+    evidence: dict[str, str] = {}        # 슬롯 → 원문에서 읽은 근거 구절 (확인 카드의 "이렇게 이해했어요")
+    unreadable: list[str] = []           # 문장에서 읽었지만 검사로 옮기지 못한 구절
+    interpreted_by: str = ""             # 해석 방식 표시 ("LLM + 키워드 교차 확인" / "키워드만 …") — 확인 카드에 보여 준다
 
 
 # ── 필수 슬롯 정의 ─────────────────────────────────────────────────────────────
@@ -82,6 +91,8 @@ _CLARIFY_QUESTIONS: dict[str, str] = {
     "period":          "올해 기준으로 볼까요, 전체 기간으로 볼까요? (year / all)",
     "group_by":        "같은 시군 안에서만 볼까요, 도 전체로 볼까요?",
     "count_distinct":  "서로 다른 사업 개수를 셀까요, 같은 사업의 횟수를 셀까요?",
+    "max":             "한 기업이 최대 몇 번까지 받을 수 있나요? (예: 1)",
+    "business":        "이번 지원 사업이 파일의 어느 사업인가요?",
     "date_window_days": "며칠 이내를 같은 건으로 볼까요? (기본 30일)",
     "scope":           "사업별 한도인가요, 모든 사업 합산 한도인가요? (per_business / total)",
     "max_amount":      "한도 금액을 정확히 알려주세요 (예: 5천만원)",
@@ -118,21 +129,145 @@ def _collect_missing(t: TranslationResponse) -> list[str]:
     return missing
 
 
-_AMOUNT_RE = re.compile(r"[\d,]+(?:\.\d+)?(?:\s*(?:억|만|천))*\s*원?")
+# 금액 표현: '5천만원', '1억2천만원', '1억 7,132만 1,210원', '60,000,000원', '5000' — 단위 뒤에 숫자가 이어지는 복합 표기를 끝까지 읽는다
+_UNIT_NUM = r"\d[\d,]*(?:\.\d+)?\s*[억만천백]+"
+_AMOUNT_RE = re.compile(rf"{_UNIT_NUM}(?:\s*{_UNIT_NUM})*(?:\s*\d[\d,]*(?=\s*원))?\s*원?|\d[\d,]*(?:\.\d+)?\s*원?")
 _INJECTION_RE = re.compile(r"이전\s*지시|지시\s*무시|bypass|ignore all|결과.*정상|모두\s*삭제")
 
 
 def _extract_amount_text(text: str) -> str | None:
-    """텍스트에서 한국어 금액 표현을 추출한다 (normalize_amount에 넘길 원문)."""
-    m = _AMOUNT_RE.search(text)
-    return m.group(0).strip() if m else None
+    """텍스트에서 한국어 금액 표현을 추출한다 (normalize_amount에 넘길 원문).
+
+    '1회', '2026년'처럼 단위 없는 숫자보다 '5천만원'처럼 금액 단위가 붙은 표현을 우선한다.
+    """
+    matches = [m.group(0).strip() for m in _AMOUNT_RE.finditer(text)]
+    if not matches:
+        return None
+    with_unit = [m for m in matches if re.search(r"[억만천원]", m)]
+    return with_unit[-1] if with_unit else matches[-1]   # 되묻기·수정 답변은 뒤에 붙으므로 나중 값이 이긴다
 
 
-def _keyword_translate(query: str) -> TranslationResponse | None:
+_THIS_BUSINESS_RE = re.compile(r"이번\s*(?:지원\s*)?사업|이\s*사업|해당\s*사업|같은\s*사업|이번\s*지원")
+_PER_COMPANY_RE = re.compile(r"한\s*(?:회사|기업|업체)\s*당|(?:회사|기업|업체)\s*(?:당|별)|1\s*사\b")
+# 파일의 특정 사업을 가리키는 표현 ("같은 사업"은 묶음 기준이지 특정 사업이 아니라서 뺀다)
+_SPECIFIC_BUSINESS_RE = re.compile(r"이번\s*(?:지원\s*)?사업|이\s*사업|해당\s*사업|이번\s*지원")
+_MANY_BUSINESS_RE = re.compile(r"두\s*(?:개|가지)\s*이상|두\s*사업\s*이상|사업\s*(?:이\s*)?두\s*개|여러\s*사업|서로\s*다른\s*사업|다른\s*사업")
+_KO_NUM = {"한": 1, "두": 2, "세": 3, "네": 4}
+_NUM = r"(\d+|한|두|세|네)"
+_AT_LEAST_RE = re.compile(_NUM + r"\s*(?:개|건|회|번|가지|사업)\s*이상")
+_UP_TO_RE = re.compile(_NUM + r"\s*(?:번|회)\s*(?:만\s*)?(?:가능|까지|이내|이하|만|씩|원칙)")
+_BARE_COUNT_RE = re.compile(_NUM + r"\s*(?:번|회)(?!\s*이상)")
+_SCOPE_TOTAL = ("합산", "total", "전체 합산", "모든 사업", "총합", "전체 기준")
+_SCOPE_PER_BUSINESS = ("per_business", "사업별", "각 사업", "사업 별", "사업당", "사업 기준", "사업마다", "사업 마다")
+
+
+def _num(v: str) -> int:
+    return _KO_NUM.get(v) or int(v)
+
+
+def _allowed_count(ql: str) -> tuple[str, str] | None:
+    """허용 횟수와 근거 구절. 'N번/회 이상'은 N-1회 허용, '한 번 가능'·'2회까지'는 그대로, 그 밖의 'N회'는 최후 수단.
+
+    수정·되묻기 답변은 문장 뒤에 붙으므로 같은 종류가 여러 개면 마지막 것을 쓴다.
+    """
+    for rx, minus in ((_AT_LEAST_RE, 1), (_UP_TO_RE, 0), (_BARE_COUNT_RE, 0)):
+        ms = list(rx.finditer(ql))
+        if ms:
+            m = ms[-1]
+            return str(_num(m.group(1)) - minus), m.group(0)
+    return None
+
+
+def _business_in(ql: str, business_names: list[str] | None) -> str | None:
+    """문장에 파일의 사업명이 하나로 정해지게 나오면 그 사업.
+
+    다른 사업명 안에 들어 있는 짧은 이름은 긴 이름이 함께 나올 때 버린다 ("창업지원" ⊂ "청년창업지원사업").
+    """
+    hits = [n for n in (business_names or []) if n and n.lower() in ql]
+    hits = [n for n in hits if not any(n != o and n.lower() in o.lower() for o in hits)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _build_sum_limit(q: str, ql: str, business_names: list[str] | None = None) -> TranslationResponse:
+    amount = _extract_amount_text(q)
+    params: dict = {"sum_column": "지원금액"}
+    missing: list[str] = []
+    evidence: dict[str, str] = {}
+    if amount:
+        evidence["max_amount"] = amount
+    else:
+        missing.append("max_amount")
+    last = lambda words: max(((ql.rfind(w), w) for w in words if w in ql), default=(-1, None))  # noqa: E731
+    (t_pos, total), (p_pos, per) = last(_SCOPE_TOTAL), last(_SCOPE_PER_BUSINESS)
+    this = _THIS_BUSINESS_RE.search(ql)
+    if total and t_pos >= p_pos:            # 수정 답변("합산으로")은 뒤에 붙으므로 더 나중에 나온 쪽이 이긴다
+        params["scope"], evidence["scope"] = "total", total
+    elif per or this:
+        params["scope"], evidence["scope"] = "per_business", per or this.group(0)
+    else:
+        missing.append("scope")
+    period: Period = "all" if ("전체" in ql and "기간" in ql) else "year"
+    return TranslationResponse(
+        intent="query", template="SUM_LIMIT", group_by=["사업자번호"], params=params,
+        amount_text=amount, period=period, missing_slots=missing, evidence=evidence,
+        filter_business=_business_in(ql, business_names),
+        description="지원금 합계 한도 초과 검사",
+    )
+
+
+def _build_near_duplicate(ql: str) -> TranslationResponse:
+    day_m = re.search(r"(\d+)\s*일", ql)
+    window = day_m.group(1) if day_m else "30"
+    return TranslationResponse(
+        intent="query", template="NEAR_DUPLICATE", group_by=["사업자번호", "사업명"],
+        params={"amount_tolerance_pct": "0", "date_window_days": window},
+        period="year", missing_slots=[], description="이중 지급 의심 검사",
+        evidence={"date_window_days": day_m.group(0)} if day_m else {},
+    )
+
+
+def _build_max_count(ql: str, *, strict: bool, business_names: list[str] | None = None) -> TranslationResponse:
+    """strict=True(계획이 지정한 검사)이면 읽지 못한 슬롯을 기본값으로 채우지 않고 되묻는다."""
+    evidence: dict[str, str] = {}
+    org = next((w for w in ("시군", "기관") if w in ql), None)
+    group_by = ["기관명", "사업자번호"] if org else ["사업자번호"]
+    if org:
+        evidence["group_by"] = org
+    missing: list[str] = []
+    allowed = _allowed_count(ql)
+    if allowed:
+        max_val, evidence["max"] = allowed
+    else:
+        if strict:
+            missing.append("max")
+        max_val = "1"
+    many, per_company, this = _MANY_BUSINESS_RE.search(ql), _PER_COMPANY_RE.search(ql), _THIS_BUSINESS_RE.search(ql)
+    if many:
+        count_distinct, evidence["count_distinct"] = "사업명", many.group(0)
+    elif this or per_company:
+        count_distinct, evidence["count_distinct"] = "행", (this or per_company).group(0)
+    elif strict:
+        count_distinct, missing = "사업명", missing + ["count_distinct"]
+    else:
+        count_distinct = "사업명"
+    params = {"max": max_val}
+    if "count_distinct" not in missing:
+        params["count_distinct"] = count_distinct
+    return TranslationResponse(
+        intent="query", template="MAX_COUNT", group_by=group_by, params=params,
+        period="all" if ("전체" in ql and "기간" in ql) else "year",
+        filter_business=_business_in(ql, business_names),
+        missing_slots=missing, evidence=evidence, description="중복 수혜(허용 횟수 초과) 검사",
+    )
+
+
+def _keyword_translate(query: str, template: str | None = None,
+                       business_names: list[str] | None = None) -> TranslationResponse | None:
     """LLM 없이 키워드 기반으로 번역을 시도한다.
 
-    LLM API 키가 없는 데모 환경에서 예시 질문 3종이 동작하도록 보장한다.
-    확신할 수 없는 슬롯은 missing_slots에 넣어 되묻기로 처리한다.
+    template 이 지정되면(계획이 복합 목표를 검사별로 나눈 경우) 그 검사의 조건만 문장에서 읽는다.
+    지정이 없으면 SUM_LIMIT → NEAR_DUPLICATE → MAX_COUNT 순으로 첫 일치 하나만 번역한다.
+    확신할 수 없는 슬롯은 missing_slots에 넣어 되묻기로 처리한다. 키워드 목록은 계획 카탈로그와 같은 것을 쓴다.
     """
     if _INJECTION_RE.search(query):
         return TranslationResponse(intent="out_of_scope")
@@ -140,79 +275,166 @@ def _keyword_translate(query: str) -> TranslationResponse | None:
     q = query  # 금액 추출 등 원문 필요
     ql = query.lower()
 
-    # ── SUM_LIMIT: 한도·초과·넘다 ───────────────────────────────────────────
-    sum_kw = ["한도", "초과", "넘는", "넘은", "넘다", "넘어"]
-    if any(w in ql for w in sum_kw):
-        amount = _extract_amount_text(q)
-        params: dict = {"sum_column": "지원금액"}
-        missing: list[str] = []
+    if template == "SUM_LIMIT":
+        return _build_sum_limit(q, ql, business_names)
+    if template == "NEAR_DUPLICATE":
+        return _build_near_duplicate(ql)
+    if template == "MAX_COUNT":
+        return _build_max_count(ql, strict=True, business_names=business_names)
 
-        if not amount:
-            missing.append("max_amount")
-
-        if any(w in ql for w in ["합산", "total", "전체 합산", "모든 사업", "총합", "전체 기준"]):
-            params["scope"] = "total"
-        elif any(w in ql for w in ["per_business", "사업별", "각 사업", "사업 별", "사업당", "사업 기준"]):
-            params["scope"] = "per_business"
-        else:
-            missing.append("scope")
-
-        period: Period = "all" if ("전체" in ql and "기간" in ql) else "year"
-
-        return TranslationResponse(
-            intent="query",
-            template="SUM_LIMIT",
-            group_by=["사업자번호"],
-            params=params,
-            amount_text=amount,
-            period=period,
-            missing_slots=missing,
-            description="지원금 합계 한도 초과 검사",
-        )
-
-    # ── NEAR_DUPLICATE: 이중 지급·두 번 나감 (MAX_COUNT보다 먼저 체크) ──────
-    dup_kw = ["이중 지급", "이중지급", "두 번 나", "두번 나", "두 번 출금",
-              "중복 지급", "중복지급", "두 번 이체", "두 번 나간", "두번 나간",
-              "같은 건이 두", "같은건이 두", "두 번 지급", "두번 지급"]
-    if any(w in ql for w in dup_kw):
-        day_m = re.search(r"(\d+)\s*일", ql)
-        window = day_m.group(1) if day_m else "30"
-
-        return TranslationResponse(
-            intent="query",
-            template="NEAR_DUPLICATE",
-            group_by=["사업자번호", "사업명"],
-            params={"amount_tolerance_pct": "0", "date_window_days": window},
-            period="year",
-            missing_slots=[],
-            description="이중 지급 의심 검사",
-        )
-
-    # ── MAX_COUNT: 중복 수혜·두 개 이상 ────────────────────────────────────
-    # "두 번 나간" 같은 NEAR_DUPLICATE 문구가 걸리지 않도록 명시적 키워드만 사용
-    max_kw = ["두 개 이상", "두개 이상", "두 가지 이상", "두가지 이상",
-              "중복 수혜", "두 사업 이상", "사업 두 개", "사업이 두 개",
-              "여러 사업", "두 번 이상 받", "두번 이상 받"]
-    if any(w in ql for w in max_kw):
-        if "시군" in ql or "기관" in ql:
-            group_by = ["기관명", "사업자번호"]
-        else:
-            group_by = ["사업자번호"]
-
-        m = re.search(r"(\d+)\s*(?:개|건|회|가지|사업)\s*이상", ql)
-        max_val = str(int(m.group(1)) - 1) if m else "1"
-
-        return TranslationResponse(
-            intent="query",
-            template="MAX_COUNT",
-            group_by=group_by,
-            params={"count_distinct": "사업명", "max": max_val},
-            period="year",
-            missing_slots=[],
-            description="중복 수혜(허용 횟수 초과) 검사",
-        )
-
+    from engine.planning import matches_capability
+    if matches_capability(ql, "sum_limit"):
+        return _build_sum_limit(q, ql, business_names)
+    if matches_capability(ql, "near_duplicate"):
+        return _build_near_duplicate(ql)
+    if matches_capability(ql, "count_limit") or "횟수" in ql:
+        return _build_max_count(ql, strict=False, business_names=business_names)
     return None  # 키워드 미탐지 → LLM 결과에 맡김
+
+
+# ── LLM 조건 추출 + 검증 + 키워드 해석과 교차 확인 ──────────────────────────────
+
+class _Condition(BaseModel):
+    template: str
+    evidence: str = ""                   # 원문에서 그대로 옮긴 구절 (검증에 쓴다)
+    slots: dict = {}
+
+
+class GoalConditions(BaseModel):
+    conditions: list[_Condition] = []
+    unreadable: list[str] = []
+
+
+def _squash(text: str) -> str:
+    return re.sub(r"\s+", "", text).lower()
+
+
+def _llm_condition(query: str, template: str, business_names: list[str]) -> TranslationResponse | None:
+    """LLM이 문장에서 뽑은 조건 중 지정 템플릿의 것을 검증해 돌려준다. 실패·검증 탈락이면 None.
+
+    LLM 출력은 신뢰하지 않는다: 근거 구절이 원문에 있어야 하고, 값은 허용 범위·원문 포함 여부를 코드로 다시 확인한다.
+    """
+    from llm.client import complete_json
+
+    try:
+        resp = complete_json(
+            "goal_conditions",
+            {"user_query": query, "business_names": ", ".join(business_names) or "없음", "target_template": template},
+            GoalConditions,
+        )
+    except Exception as e:
+        logger.warning("조건 추출 LLM 실패 → 키워드 해석만 사용: %s", e)
+        return None
+    unreadable = [u for u in resp.unreadable if u.strip() and _squash(u) in _squash(query)]
+    for cond in resp.conditions:
+        if cond.template != template:
+            continue
+        if not cond.evidence or _squash(cond.evidence) not in _squash(query):
+            logger.warning("LLM 조건의 근거 구절이 원문에 없어 버림: %r", cond.evidence)
+            continue
+        return _verified_condition(cond, query, business_names, unreadable)
+    return None
+
+
+def _verified_condition(cond: _Condition, query: str, business_names: list[str],
+                        unreadable: list[str]) -> TranslationResponse:
+    s, ev = cond.slots, cond.evidence
+    out = TranslationResponse(intent="query", template=cond.template, unreadable=unreadable)  # type: ignore[arg-type]
+    out.period = s.get("period") if s.get("period") in ("year", "all") else None
+    biz = s.get("filter_business")
+    out.filter_business = biz if biz in business_names else None
+    if cond.template == "MAX_COUNT":
+        out.group_by = ["기관명", "사업자번호"] if s.get("group_scope") == "org" else ["사업자번호"]
+        mx = str(s.get("max", "")).strip()
+        if mx.isdigit() and 0 <= int(mx) <= 20:
+            out.params["max"], out.evidence["max"] = mx, ev
+        if s.get("count_distinct") in ("행", "사업명"):
+            out.params["count_distinct"], out.evidence["count_distinct"] = s["count_distinct"], ev
+        out.missing_slots = [k for k in ("max", "count_distinct") if k not in out.params]
+    elif cond.template == "SUM_LIMIT":
+        out.group_by = ["사업자번호"]
+        out.params["sum_column"] = "지원금액"
+        amount = str(s.get("max_amount_text", "")).strip()
+        if amount and _squash(amount) in _squash(query):     # 원문에 없는 금액은 받지 않는다
+            out.amount_text, out.evidence["max_amount"] = amount, ev
+        if s.get("scope") in ("per_business", "total"):
+            out.params["scope"], out.evidence["scope"] = s["scope"], ev
+        out.missing_slots = (["max_amount"] if not out.amount_text else []) + \
+                            (["scope"] if "scope" not in out.params else [])
+    elif cond.template == "NEAR_DUPLICATE":
+        out.group_by = ["사업자번호", "사업명"]
+        out.params["amount_tolerance_pct"] = "0"
+        days = str(s.get("date_window_days", "")).strip()
+        if days.isdigit() and 0 <= int(days) <= 365:
+            out.params["date_window_days"], out.evidence["date_window_days"] = days, ev
+    return out
+
+
+def _amount_value(text: str | None) -> str | None:
+    if not text:
+        return None
+    from engine.rules.amount import normalize_amount
+    return normalize_amount(text).value
+
+
+def _explicit_slots(t: TranslationResponse) -> dict[str, str]:
+    """번역 결과에서 '문장에서 실제로 읽은' 슬롯만 뽑는다 (기본값으로 채운 것은 제외)."""
+    miss = set(t.missing_slots)
+    if t.template == "MAX_COUNT":
+        return {k: str(t.params[k]) for k in ("max", "count_distinct") if k in t.params and k not in miss}
+    if t.template == "SUM_LIMIT":
+        out = {}
+        if "scope" in t.params and "scope" not in miss:
+            out["scope"] = str(t.params["scope"])
+        if _amount_value(t.amount_text):
+            out["max_amount"] = _amount_value(t.amount_text)  # type: ignore[assignment]
+        return out
+    if t.template == "NEAR_DUPLICATE" and "date_window_days" in t.evidence:
+        return {"date_window_days": str(t.params["date_window_days"])}
+    return {}
+
+
+def _merge_translations(kw: TranslationResponse, llm: TranslationResponse) -> TranslationResponse:
+    """키워드 해석과 LLM 해석을 슬롯별로 교차 확인한다.
+
+    한쪽만 읽었으면 그 값을 쓰고, 둘이 같으면 확정, 서로 다르면 어느 쪽도 믿지 않고 되묻는다.
+    """
+    a, b = _explicit_slots(kw), _explicit_slots(llm)
+    out = kw.model_copy(deep=True)
+    out.unreadable = list(dict.fromkeys([*kw.unreadable, *llm.unreadable]))
+    if not out.filter_business:
+        out.filter_business = llm.filter_business
+    names = {"MAX_COUNT": ("max", "count_distinct"), "SUM_LIMIT": ("max_amount", "scope"),
+             "NEAR_DUPLICATE": ("date_window_days",)}.get(kw.template or "", ())
+    missing = [m for m in kw.missing_slots if m not in names]
+    for slot in names:
+        va, vb = a.get(slot), b.get(slot)
+        if va and vb and va != vb:
+            logger.warning("키워드(%s)와 LLM(%s)의 %s 해석이 달라 되묻는다", va, vb, slot)
+            value = None
+        else:
+            value = va or vb
+        if slot == "max_amount":
+            if value is None:
+                out.amount_text = None
+                missing.append(slot)
+            else:
+                out.amount_text = kw.amount_text if va else llm.amount_text
+                if not va and slot in llm.evidence:
+                    out.evidence[slot] = llm.evidence[slot]
+            continue
+        if value is None:
+            out.params.pop(slot, None)
+            if slot != "date_window_days":
+                missing.append(slot)
+            else:
+                out.params["date_window_days"] = "30"
+            continue
+        out.params[slot] = value
+        if slot not in out.evidence and slot in llm.evidence:
+            out.evidence[slot] = llm.evidence[slot]
+    out.missing_slots = list(dict.fromkeys(missing))
+    return out
 
 
 def _apply_defaults(t: TranslationResponse) -> TranslationResponse:
@@ -285,26 +507,43 @@ def translate_node(state: QueryState) -> QueryState:
     if not query:
         return {**state, "intent": "out_of_scope"}
 
-    # 사업명 목록 수집
-    biz_specs = load_business_master(_MASTER_FILE)
-    biz_names = ", ".join({s.filter_business for s in biz_specs if s.filter_business}) or "없음"
+    # 사업명 목록: 집계 대상 파일에서 읽은 것이 있으면 그것, 없으면 사업 기준표
+    names: list[str] = list(state.get("business_names") or [])
+    if not names:
+        names = sorted({s.filter_business for s in load_business_master(_MASTER_FILE) if s.filter_business})
+    biz_names = ", ".join(names) or "없음"
 
+    hint = state.get("template_hint") or None   # 복합 목표를 검사별로 나눠 번역할 때만 지정
     resp: TranslationResponse | None = None
-    try:
-        resp = complete_json(
-            "rule_request",
-            {"user_query": query, "business_names": biz_names},
-            TranslationResponse,
-        )
-    except Exception as e:
-        logger.warning("번역 LLM 호출 실패 → 키워드 fallback 시도: %s", e)
 
-    # LLM 실패 또는 out_of_scope → 키워드 기반 재시도
-    if resp is None or resp.intent == "out_of_scope":
-        kw = _keyword_translate(query)
-        if kw is not None:
+    if hint:
+        # 계획이 정한 검사: 키워드 해석 + LLM 조건 추출(검증됨)을 교차 확인한다. LLM이 없어도 키워드 해석으로 진행한다.
+        kw = _keyword_translate(query, hint, names)
+        if kw is not None and kw.intent == "out_of_scope":
             resp = kw
-            logger.info("키워드 번역 성공: template=%s", kw.template)
+        else:
+            llm = _llm_condition(query, hint, names)
+            resp = _merge_translations(kw, llm) if (kw and llm) else (kw or llm)
+            if resp is not None:
+                resp.interpreted_by = ("LLM + 키워드 교차 확인" if (kw and llm) else
+                                       "LLM만 (키워드로 읽지 못함)" if llm else
+                                       "키워드만 (LLM 응답 없음 또는 검증 탈락)")
+    else:
+        try:
+            resp = complete_json(
+                "rule_request",
+                {"user_query": query, "business_names": biz_names, "target_template": "지정 없음"},
+                TranslationResponse,
+            )
+        except Exception as e:
+            logger.warning("번역 LLM 호출 실패 → 키워드 fallback 시도: %s", e)
+
+        # LLM 실패 또는 out_of_scope → 키워드 기반 재시도
+        if resp is None or resp.intent == "out_of_scope":
+            kw = _keyword_translate(query, None, names)
+            if kw is not None:
+                resp = kw
+                logger.info("키워드 번역 성공: template=%s", kw.template)
 
     if resp is None:
         resp = TranslationResponse(intent="out_of_scope")
@@ -335,9 +574,9 @@ def validate_node(state: QueryState) -> QueryState:
         clarify_count = state.get("clarify_count", 0)
         if clarify_count >= MAX_CLARIFY_ROUNDS:
             # 기본값으로 채우고 진행
+            state = {**state, "defaults_used": [_SLOT_LABELS.get(m, m) for m in missing]}
             t = _apply_defaults(t)
             missing = []
-            question = "(기본값 적용됨) 다음 조건으로 검사합니다."
         else:
             first_missing = missing[0]
             question = _CLARIFY_QUESTIONS.get(first_missing, f"'{first_missing}'을 알려주세요")
@@ -360,7 +599,7 @@ def validate_node(state: QueryState) -> QueryState:
         }
 
     # 확인 카드 생성
-    card = _make_confirm_card(spec)
+    card = _make_confirm_card(spec, t.evidence, t.unreadable, t.interpreted_by, state.get("defaults_used"))
     return {
         **state,
         "missing_slots": [],
@@ -382,8 +621,14 @@ def clarify_node(state: QueryState, user_answer: str) -> QueryState:
     }
 
 
-def _make_confirm_card(spec: RuleSpec) -> dict:
-    """확인 카드 dict 생성."""
+_SLOT_LABELS = {"business": "사업 한정", "max": "허용 횟수", "count_distinct": "집계 대상", "max_amount": "한도", "scope": "범위",
+                "date_window_days": "날짜 간격", "group_by": "묶는 기준"}
+
+
+def _make_confirm_card(spec: RuleSpec, evidence: dict[str, str] | None = None,
+                       unreadable: list[str] | None = None, interpreted_by: str = "",
+                       defaults: list[str] | None = None) -> dict:
+    """확인 카드 dict 생성. evidence 가 있으면 값마다 원문 근거를 덧붙인다 ("이렇게 이해했어요")."""
     template_kr = {"MAX_COUNT": "중복 수혜 검사", "NEAR_DUPLICATE": "이중 지급 의심 검사", "SUM_LIMIT": "한도 초과 검사"}
     card: dict = {
         "검사 종류": template_kr.get(spec.template, spec.template),
@@ -403,6 +648,15 @@ def _make_confirm_card(spec: RuleSpec) -> dict:
         card["범위"] = p.get("scope", "per_business")
     if spec.filter_business:
         card["사업 필터"] = spec.filter_business
+    for slot, quote in (evidence or {}).items():
+        if quote and slot in _SLOT_LABELS:
+            card[f"└ 근거({_SLOT_LABELS[slot]})"] = f"“{quote}”"
+    if unreadable:
+        card["해석하지 못한 구절"] = "; ".join(unreadable)
+    if interpreted_by:
+        card["해석 방식"] = interpreted_by
+    if defaults:
+        card["기본값 적용"] = ", ".join(defaults) + " — 답변을 읽지 못해 기본값으로 채웠습니다. 다르면 아래에서 고쳐 주세요."
     return card
 
 
@@ -548,3 +802,104 @@ def out_of_scope_response(user_query: str) -> dict:
         )
 
     return {"message": message, "buttons": _OUT_OF_SCOPE_BUTTONS if not is_injection else []}
+
+
+# ── 사용자 답변 적용 ──────────────────────────────────────────────────────────
+# 사용자가 직접 답한 값은 LLM·키워드 해석과 충돌해도 항상 이긴다 (충돌이 풀리지 않아 같은 질문이 반복되는 것을 막는다).
+
+def _answer_value(slot: str, text: str, names: list[str]) -> tuple[str, object] | None:
+    """답변 문장에서 슬롯 값을 읽는다. 읽지 못하면 None. 반환: (적용 대상, 값)"""
+    tl = text.lower()
+    if slot == "max":
+        got = _allowed_count(tl)
+        return ("params", got[0]) if got else None
+    if slot == "count_distinct":
+        if _MANY_BUSINESS_RE.search(tl):
+            return "params", "사업명"
+        if _THIS_BUSINESS_RE.search(tl) or _PER_COMPANY_RE.search(tl):
+            return "params", "행"
+        return None
+    if slot == "scope":
+        total = max((tl.rfind(w) for w in _SCOPE_TOTAL if w in tl), default=-1)
+        per = max((tl.rfind(w) for w in _SCOPE_PER_BUSINESS if w in tl), default=-1)
+        if total < 0 and per < 0:
+            return None
+        return "params", "total" if total >= per else "per_business"
+    if slot == "period":
+        if "전체" in tl and "기간" in tl:
+            return "period", "all"
+        return ("period", "year") if ("올해" in tl or "금년" in tl) else None
+    if slot == "business":
+        exact = next((n for n in names if n == text.strip()), None)
+        return ("filter_business", exact or _business_in(tl, names)) if (exact or _business_in(tl, names)) else None
+    if slot == "max_amount":
+        amount = _extract_amount_text(text)
+        return ("amount_text", amount) if amount and _amount_value(amount) else None
+    if slot == "date_window_days":
+        m = re.search(r"(\d+)\s*일", tl)
+        return ("params", m.group(1)) if m else None
+    return None
+
+
+_ANSWER_SLOTS = ("max", "count_distinct", "scope", "period", "business", "max_amount", "date_window_days")
+
+
+def apply_user_answers(translation: dict, answers: list, names: list[str]) -> tuple[dict, list[str]]:
+    """사용자 답변을 번역 결과에 덮어쓴다. 반환: (번역, 답을 읽지 못한 슬롯 목록)."""
+    t = dict(translation)
+    t["params"] = dict(t.get("params", {}))
+    t["evidence"] = dict(t.get("evidence", {}))
+    missing = list(t.get("missing_slots", []))
+    unread: list[str] = []
+    for slot, text in answers:
+        for s in (_ANSWER_SLOTS if slot == "*" else (slot,)):
+            got = _answer_value(s, str(text), names)
+            if got is None:
+                if slot != "*":
+                    unread.append(s)
+                continue
+            target, value = got
+            if target == "params":
+                t["params"][s] = value
+            else:
+                t[target] = value
+            t["evidence"][s] = str(text)
+            missing = [m for m in missing if m != s]
+            unread = [u for u in unread if u != s]
+    t["missing_slots"] = missing
+    return t, unread
+
+
+# ── 목표 해석 요약 ("이렇게 이해했어요") ──────────────────────────────────────
+
+_VALUE_TEXT = {
+    "count_distinct": {"행": "같은 사업을 받은 횟수", "사업명": "서로 다른 사업의 수"},
+    "scope": {"per_business": "사업별로 따로", "total": "모든 사업 합산"},
+}
+
+
+def _show_value(slot: str, value: str) -> str:
+    if slot == "max_amount":
+        return f"{int(value):,}원"
+    if slot == "max":
+        return f"{value}회"
+    if slot == "date_window_days":
+        return f"{value}일 이내"
+    return _VALUE_TEXT.get(slot, {}).get(value, value)
+
+
+def interpret_goal(goal: str, plan, business_names: list[str] | None = None) -> list[dict]:
+    """계획의 집계 검사마다 목표 문장에서 읽은 값·근거와 되물을 항목을 정리한다 (키워드 해석 기준 — LLM 호출 없음)."""
+    out: list[dict] = []
+    for step in plan.steps:
+        template = AGGREGATE_TEMPLATES.get(step.capability)
+        if step.status != "run" or template is None:
+            continue
+        t = _keyword_translate(goal, template, business_names)
+        if t is None or t.intent != "query":
+            continue
+        read = [(_SLOT_LABELS[k], _show_value(k, v), t.evidence.get(k, ""))
+                for k, v in _explicit_slots(t).items() if k in _SLOT_LABELS]
+        out.append({"capability": step.capability, "label": step.label, "read": read,
+                    "ask": [_SLOT_LABELS.get(m, m) for m in t.missing_slots]})
+    return out

@@ -20,6 +20,7 @@ import streamlit as st
 from langgraph.types import Command
 
 from config import settings
+from engine import fixer
 from engine.masking import mask_changes, mask_issues
 from engine.models import Decision, Issue
 
@@ -51,10 +52,13 @@ _DEFAULTS: dict = {
     "run_config":      None,
     "uploaded_paths":  [],   # 이번 실행에 사용된 파일 경로 목록
     "pending_rerun":   False, # 다음 목표 재실행 플래그
+    "agg_requests":    [],   # 집계 위반 확인 요청 메일 초안 (RequestItem 목록)
+    "export_zips":     None, # 내려받기용 엑셀 ZIP (표시된 것·발표용)
+    "viewer_decisions": {},  # 뷰어·승인 화면에서 담당자가 고른 결정 (재개 전, 미리보기용) {issue_id: {action, value}}
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
-        st.session_state[_k] = list(_v) if isinstance(_v, list) else _v
+        st.session_state[_k] = list(_v) if isinstance(_v, list) else (dict(_v) if isinstance(_v, dict) else _v)
 
 
 # ── 유틸 ──────────────────────────────────────────────────────────────────────
@@ -70,13 +74,9 @@ def _get_dataset():
 
 
 def _agg_rows(res: dict) -> list[dict]:
-    """집계 결과의 묶음 목록을 표시용 행으로 바꾼다 (사업자번호 마스킹)."""
-    from engine.masking import mask_bizno
-    return [{
-        "그룹": " / ".join(f"{k}: {mask_bizno(v) if k == '사업자번호' else v}"
-                          for k, v in g.group_key.items()),
-        "행": len(g.rows), "지표": g.metric, "등급": g.tier,
-    } for g in res.get("group_issues", [])]
+    """집계 결과의 묶음 목록을 표시용 행으로 바꾼다 (파일·위치 포함, 사업자번호 마스킹)."""
+    from agent.nodes.aggregate import group_issue_rows
+    return group_issue_rows(res)
 
 
 def _archive_current_run() -> None:
@@ -186,6 +186,25 @@ def _get_compiled_graph():
     return st.session_state.compiled_graph
 
 
+def _persist_dispositions(dispositions: dict[str, str]) -> None:
+    """집계 위반 처리 결과(확인 요청/문제 없음)를 그래프 상태에 저장한다 — 뷰어·내보내기가 같은 값을 읽도록."""
+    _state = st.session_state.state or {}
+    try:
+        _get_compiled_graph().update_state(st.session_state.run_config, {"agg_dispositions": dispositions})
+    except Exception as _e:   # 화면 동작은 계속하되, 저장 실패는 기록한다
+        _log(f"집계 처리 결과 저장 실패: {_e}")
+    st.session_state.state = {**_state, "agg_dispositions": dispositions}
+
+
+def _note_review_decision(issue_id: str) -> None:
+    """승인 화면에서 담당자가 직접 고른 결정을 기록한다 — 뷰어 미리보기가 같은 선택을 보여 주도록."""
+    _act = st.session_state.get(f"act_{issue_id}")
+    _val = (st.session_state.get(f"ev_{issue_id}") or None) if _act == "edit" else None
+    _d = dict(st.session_state.get("viewer_decisions", {}))
+    _d[issue_id] = {"action": _act, "value": _val}
+    st.session_state["viewer_decisions"] = _d
+
+
 def _proactive_summary(issues: list[Issue], n_files: int) -> str:
     n      = len(issues)
     auto_c = sum(1 for i in issues if i.tier == "auto")
@@ -207,15 +226,30 @@ def _proactive_summary(issues: list[Issue], n_files: int) -> str:
 
 def _plan_card_md(plan) -> str:
     """계획 카드: 실행·선행·생략(이유)을 보여준다."""
+    from agent.nodes.query import interpret_goal
+    from engine.planning import plan_source_label
+
     if plan.status == "needs_clarification":
         return f"❓ **계획 확인 필요** — {plan.question}"
     _icon = {"run": "▶️ 실행", "dependency": "➕ 선행 작업", "skipped": "⏭️ 생략"}
-    _lines = [f"📋 **실행 계획** — 목표: *{plan.goal or '(없음: 기본 전체 점검)'}*", ""]
+    _lines = [f"📋 **실행 계획** — 목표: *{plan.goal or '(없음: 기본 전체 점검)'}*",
+              f"🧭 계획 해석 방식: {plan_source_label(plan.source)}", ""]
     for _s in plan.steps:
         _tail = f"생략({_s.reason})" if _s.status == "skipped" else _s.reason
         _lines.append(f"- {_icon[_s.status]} **{_s.label}** — {_tail}")
-        if _s.status == "run" and _s.capability in ("sum_limit", "aggregate_view"):
+        if _s.status == "run" and _s.capability in ("sum_limit", "count_limit", "near_duplicate"):
             _lines[-1] += " (실행 중 기준을 확인합니다)"
+    _reads = interpret_goal(plan.goal, plan) if plan.goal else []
+    if _reads:
+        _lines += ["", "🔎 **이렇게 이해했어요** (문장에서 읽은 값 · 근거 — 실행 전 확인 카드에서 다시 확인합니다)"]
+        for _r in _reads:
+            _vals = " · ".join(f"{_k} {_v}" + (f" (“{_q}”)" if _q else "") for _k, _v, _q in _r["read"]) or "읽은 값 없음"
+            _ask = f" — 확인할 것: {', '.join(_r['ask'])}" if _r["ask"] else ""
+            _lines.append(f"- {_r['label']}: {_vals}{_ask}")
+    if plan.unhandled:
+        _lines += ["", "⚠️ **이번 점검에서 제외된 조건** (해석할 수 없어 확인을 거쳐 제외했습니다)"]
+        _lines += [f"- “{_c}”" for _c in plan.unhandled]
+        _lines.append("(위 조건은 검사하지 않습니다. 필요하면 목표를 다시 써 주세요.)")
     return "\n".join(_lines)
 
 
@@ -240,10 +274,13 @@ def _resume_agent(resume_value, label: str) -> None:
     """interrupt 로 멈춘 그래프를 재개하고 세션 상태를 갱신한다."""
     _compiled = _get_compiled_graph()
     _cfg = st.session_state.run_config
+    from ui.components.live_viewer import LiveViewer
+    _live = LiveViewer(st.empty())
+    _live.state.update(st.session_state.state or {})     # 재개 전까지의 상태에서 이어서 보여 준다
     with st.status(label, expanded=True) as _st:
         _stream_events(
             _compiled.stream(Command(resume=resume_value), _cfg, stream_mode="updates"),
-            status_widget=_st,
+            status_widget=_st, live=_live,
         )
     _after_run(_compiled.get_state(_cfg), st.session_state.uploaded_paths)
 
@@ -273,10 +310,15 @@ def _after_run(_snapshot, paths: list[str]) -> None:
         st.session_state.phase = "done"
 
 
-def _stream_events(event_iter, status_widget=None) -> None:
-    """LangGraph 스트림 이벤트를 처리하며 화면과 채팅 히스토리에 기록한다."""
+def _stream_events(event_iter, status_widget=None, live=None) -> None:
+    """LangGraph 스트림 이벤트를 처리하며 화면과 채팅 히스토리에 기록한다. live 가 있으면 실시간 뷰어도 갱신한다."""
     for _event in event_iter:
         for _node, _out in _event.items():
+            if live is not None:
+                try:
+                    live.on_event(_node, _out)       # 노드가 끝날 때마다 파일 현황 표 갱신
+                except Exception as _e:               # 표시 실패가 에이전트 실행을 막으면 안 된다
+                    _log(f"실시간 뷰어 갱신 실패: {_e}")
             if _node == "planner":
                 _reason = _out.get("agent_reason", "")
                 _action = _out.get("agent_action", "")
@@ -322,6 +364,9 @@ def _run_agent(paths: list[str]) -> None:
     st.session_state.uploaded_paths = paths
     st.session_state.activity_log   = []
     st.session_state.approval_log   = []
+    st.session_state.agg_requests   = []
+    st.session_state.viewer_decisions = {}
+    st.session_state.export_zips      = None
     _log(f"Agent 시작: run_id={_run_id}, 목표={st.session_state.goal!r}")
 
     _initial = {
@@ -333,10 +378,12 @@ def _run_agent(paths: list[str]) -> None:
         "agent_loop_count": 0,
     }
     _compiled = _get_compiled_graph()
+    from ui.components.live_viewer import LiveViewer
+    _live = LiveViewer(st.empty())
     with st.status("🤖 Agent 실행 중...", expanded=True) as _st:
         _stream_events(
             _compiled.stream(_initial, _config, stream_mode="updates"),
-            status_widget=_st,
+            status_widget=_st, live=_live,
         )
 
     _after_run(_compiled.get_state(_config), paths)
@@ -369,7 +416,7 @@ with st.sidebar:
         st.info(f"run_id: `{st.session_state.run_id}`")
     if st.button("🔄 초기화", use_container_width=True):
         for _k, _v in _DEFAULTS.items():
-            st.session_state[_k] = list(_v) if isinstance(_v, list) else _v
+            st.session_state[_k] = list(_v) if isinstance(_v, list) else (dict(_v) if isinstance(_v, dict) else _v)
         st.rerun()
     st.divider()
     st.subheader("📋 실행 로그")
@@ -538,7 +585,7 @@ with st.container():
                 _ans = None
                 if _opts:
                     _labels = {o["id"]: o["label"] for o in _opts}
-                    _ans = st.radio("검사 종류", list(_labels), format_func=lambda k: _labels[k],
+                    _ans = st.radio("선택", list(_labels), format_func=lambda k: _labels[k],
                                     key="agg_clarify_radio")
                 else:
                     _ans = st.text_input("답변", key="agg_clarify_text",
@@ -552,9 +599,15 @@ with st.container():
                 st.markdown(_clar.get("question", "실행할 검사를 선택해 주세요."))
                 _opts = _clar.get("options", [])
                 _labels = {o["id"]: o["label"] for o in _opts}
-                _picked = st.multiselect(
-                    "실행할 검사", list(_labels), format_func=lambda k: _labels[k], key="clarify_pick",
-                )
+                if any(k.startswith("skip::") for k in _labels):
+                    # 해석하지 못한 조건 — 건너뛰지 않고 하나를 골라 처리 방법을 정한다
+                    _one = st.radio("처리 방법", list(_labels), format_func=lambda k: _labels[k],
+                                    key="clarify_unhandled_pick")
+                    _picked = [_one] if _one else []
+                else:
+                    _picked = st.multiselect(
+                        "실행할 검사", list(_labels), format_func=lambda k: _labels[k], key="clarify_pick",
+                    )
                 if st.button("✅ 선택 완료 — 계획 확정", type="primary",
                              disabled=not _picked, use_container_width=True):
                     _resume_agent(_picked, "🤖 계획 확정 후 Agent 실행 중...")
@@ -566,6 +619,11 @@ with st.container():
             st.subheader("✅ 이 조건으로 집계 검사를 실행할까요?")
             for _k, _v in _conf.get("card", {}).items():
                 st.markdown(f"**{_k}**: {_v}")
+            _fix = st.text_input("해석이 다르면 고칠 내용을 적어 주세요", key="agg_edit_text",
+                                 placeholder="예: 한도는 7천만원, 합산으로 / 시군 안에서만")
+            if st.button("✏️ 수정 반영", disabled=not (_fix and _fix.strip()), key="agg_edit"):
+                _resume_agent(f"edit:{_fix.strip()}", "🤖 수정한 조건으로 다시 해석 중...")
+                st.rerun()
             _c1, _c2 = st.columns(2)
             if _c1.button("🔍 실행", type="primary", use_container_width=True, key="agg_run"):
                 _resume_agent("run", "🤖 집계 규칙 실행 중...")
@@ -678,11 +736,16 @@ with st.container():
                             st.write(f"**제안**: `{_i.suggestion}`")
                         # 중복 행은 삭제이므로 기본값을 reject(유지)로 둔다
                         _act = st.radio(
-                            "처리", ["apply", "reject", "edit"],
+                            "처리", ["apply", "reject", "request", "edit"],
+                            format_func=lambda k: {"apply": "승인(적용)", "reject": "거절(유지)",
+                                                   "request": "확인 요청", "edit": "직접 수정"}[k],
                             index=1 if _i.rule_id == "DUPLICATE_ROW" else 0,
                             key=f"act_{_i.issue_id}", horizontal=True,
+                            on_change=_note_review_decision, args=(_i.issue_id,),
                         )
-                        _ev = st.text_input("직접 입력", key=f"ev_{_i.issue_id}") if _act == "edit" else None
+                        _ev = (st.text_input("직접 입력", key=f"ev_{_i.issue_id}",
+                                             on_change=_note_review_decision, args=(_i.issue_id,))
+                               if _act == "edit" else None)
                         _dec_map[_i.issue_id] = {"action": _act, "value": _ev}
 
                 def _remember_approvals(ds: list[Decision]) -> None:
@@ -704,6 +767,13 @@ with st.container():
                                  value=v.get("value"), decided_by="operator")
                         for iid, v in _dec_map.items()
                     ]
+                    # 직접 수정 값은 해당 규칙으로 검증하고 표준 형식으로 저장한다 (틀리면 아래에서 막는다)
+                    _by_id = {i.issue_id: i for i in _state.get("issues", [])}
+                    for _d in _ds:
+                        if _d.action == "edit" and _d.issue_id in _by_id:
+                            _norm, _err = fixer.validate_edit(_by_id[_d.issue_id], _d.value or "")
+                            if not _err:
+                                _d.value = _norm
                     if _bulk_ids and st.session_state.get("_bulk_delete_pressed"):
                         _ds += [Decision(issue_id=iid, action="apply", decided_by="operator")
                                 for iid in _bulk_ids]
@@ -723,13 +793,35 @@ with st.container():
                         st.session_state["_bulk_delete_pressed"] = False
                         st.rerun()
 
+                def _edit_errors(ds: list[Decision]) -> list[str]:
+                    """직접 수정 값이 규칙에 맞지 않으면 이유를 모아 돌려준다 — 틀린 값으로 재개하지 않는다."""
+                    _by = {i.issue_id: i for i in _appr_issues}
+                    _out = []
+                    for d in ds:
+                        if d.action == "edit" and d.issue_id in _by:
+                            _e = fixer.validate_edit(_by[d.issue_id], d.value or "")[1]
+                            if _e:
+                                _out.append(f"{d.issue_id}: {_e}")
+                    return _out
+
                 if st.button("✅ 승인 후 Agent 실행 재개", type="primary", use_container_width=True):
-                    _remember_approvals(_human_decisions())
-                    _resume_agent([d.model_dump() for d in _human_decisions()],
-                                  "🤖 Agent 재개 중...")
+                    _now = _human_decisions()
+                    _errs = _edit_errors(_now)
+                    if _errs:
+                        for _e in _errs:
+                            st.error(_e)
+                    else:
+                        _remember_approvals(_now)
+                        _resume_agent([d.model_dump() for d in _now], "🤖 Agent 재개 중...")
                     # st.rerun() 없이 계속 진행 → ④ 결과 섹션이 바로 렌더링됨
 
-        elif _appr_issues and st.session_state.phase == "done":
+        # 파일로 보기 — 변경 내역 뷰어. 고른 결정은 아직 적용 전이라 미리보기로 보여 준다.
+        if st.session_state.phase == "diagnosed" and _state.get("dataset") is not None:
+            with st.expander("📂 파일로 보기 (엑셀처럼 셀 단위로 확인하고 바로 처리)", expanded=False):
+                from ui.components.viewer_screen import render_viewer
+                render_viewer(_state, finalized=False, allow_decisions=True, key="viewer_review")
+
+        if _appr_issues and st.session_state.phase == "done":
             # 승인 완료 요약
             _changes = mask_changes((st.session_state.state or {}).get("changes", []))
             _op_n = sum(1 for c in _changes if c.decided_by == "operator")
@@ -746,9 +838,14 @@ with st.container():
     if st.session_state.phase == "done":
         _agg_results = (st.session_state.state or {}).get("agg_results", [])
         if _agg_results:
-            from engine.masking import mask_bizno
             with st.container(border=True):
                 st.subheader("📊 집계 규칙 결과")
+                from agent.nodes.aggregate_requests import (
+                    DISP_REQUEST, OK, REQUEST, build_aggregate_requests, collect_group_issues,
+                    disposition_to_label, issue_key, label_to_disposition, ok_keys,
+                )
+                _stored_disp = (st.session_state.state or {}).get("agg_dispositions") or {}
+                _new_disp: dict[str, str] = {}
                 for _ri, _res in enumerate(_agg_results):
                     _spec = _res.get("spec")
                     _title = _spec.description if _spec else "집계 검사"
@@ -756,19 +853,45 @@ with st.container():
                     st.write(_res.get("response_text", ""))
                     _gi = _res.get("group_issues", [])
                     if _gi:
-                        _rows = [{
-                            "그룹": " / ".join(
-                                f"{k}: {mask_bizno(v) if k == '사업자번호' else v}"
-                                for k, v in g.group_key.items()),
-                            "행": len(g.rows), "지표": g.metric, "등급": g.tier,
-                        } for g in _gi]
-                        st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
+                        # 위반 묶음마다 처리 선택: 기본은 기관에 확인 요청, 확인해 보니 정상이면 '문제 없음'
+                        _df = pd.DataFrame(_agg_rows(_res)).drop(columns=["등급"])
+                        _df.insert(0, "처리", [disposition_to_label(_stored_disp.get(issue_key(_res["capability"], _g)))
+                                              for _g in _gi])
+                        _edited = st.data_editor(
+                            _df, hide_index=True, use_container_width=True, key=f"agg_edit_{_ri}",
+                            column_config={"처리": st.column_config.SelectboxColumn(
+                                "처리", options=[REQUEST, OK], required=True,
+                                help="확인 요청: 해당 기관에 확인(소명)을 요청 / 문제 없음: 확인해 보니 정상")},
+                            disabled=[c for c in _df.columns if c != "처리"],
+                        )
+                        for _pos, _g in enumerate(_gi):
+                            _new_disp[issue_key(_res["capability"], _g)] = label_to_disposition(_edited.iloc[_pos]["처리"])
                     if _spec and st.button("💾 이 기준 저장", key=f"agg_save_{_ri}"):
                         from agent.nodes.query import save_rule_node
                         _saved = save_rule_node({"confirmed_spec": _spec})
                         _add_activity("✅ 집계 기준 저장 완료." if _saved.get("saved") else "기준 저장 실패")
                         st.success("기준을 저장했습니다." if _saved.get("saved") else "저장 실패")
                     st.divider()
+
+                if _new_disp != {_k: _stored_disp.get(_k, DISP_REQUEST) for _k in _new_disp}:
+                    _persist_dispositions(_new_disp)             # 바뀐 처리 결과만 그래프 상태에 저장
+                _ok_keys = ok_keys(_new_disp)
+                if collect_group_issues(_agg_results):
+                    _n_req = sum(1 for _k, _, _ in collect_group_issues(_agg_results) if _k not in _ok_keys)
+                    st.caption(f"확인 요청 {_n_req}건 · 문제 없음 {len(collect_group_issues(_agg_results)) - _n_req}건")
+                    if st.button("📩 확인 요청 메일 초안 만들기", disabled=_n_req == 0, key="agg_mail_make"):
+                        from notify.contacts import resolve_recipient
+                        st.session_state.agg_requests = build_aggregate_requests(
+                            _agg_results, _ok_keys,
+                            recipient_for=lambda _f: resolve_recipient(_f, (st.session_state.state or {}).get("dataset")))
+                        st.rerun()
+                from ui.components.mail_panel import render_mail_panel
+                render_mail_panel(
+                    st.session_state.agg_requests,
+                    run_dir=settings.outputs_dir / (st.session_state.run_id or "unknown"),
+                    key="aggmail", title="📩 집계 확인 요청 메일",
+                    on_update=lambda _all: st.session_state.__setitem__("agg_requests", _all),
+                )
 
     # ═══════════════════════════════════════════════════════════════════════
     # ④ 결과  — 완료 후 표시
@@ -780,6 +903,42 @@ with st.container():
 
         with st.container(border=True):
             st.subheader("④ 결과")
+
+            if _state.get("dataset") is not None:
+                st.markdown("#### 📂 변경 내역 (파일로 보기)")
+                from ui.components.viewer_screen import render_viewer
+                render_viewer(_state, finalized=True, allow_decisions=False, key="viewer_result")
+
+                with st.expander("📥 엑셀로 내려받기 (상태 색·메모 포함)"):
+                    st.caption("엑셀은 셀에 최종 값만 들어가고 상태는 배경색과 메모(마우스를 올리면 보임)로 표시됩니다. "
+                               "JSON 파일은 원래 JSON 형식으로, 변경 이력은 CSV로 내려받습니다. "
+                               "‘발표용’은 사업자번호·기업명 열까지 가린 파일입니다. 원본 엑셀의 서식은 유지하지 않습니다.")
+                    if st.button("📄 엑셀 파일 만들기", key="export_marked"):
+                        from engine.marked_export import (
+                            amount_columns_from_profiles, build_export_bundle, save_marked_workbooks, zip_workbooks,
+                        )
+                        from ui.components.viewer_screen import compute_marks
+                        _marks, _cleaned = compute_marks(_state, finalized=True)
+                        _amt = amount_columns_from_profiles(_state.get("profiles"))
+                        _dir = settings.outputs_dir / (_state.get("run_id") or "unknown")
+                        _made = {}
+                        for _masked in (False, True):
+                            _files = build_export_bundle(_state["dataset"], _cleaned, _marks,
+                                                         input_paths=_state.get("input_paths"),
+                                                         masked=_masked, amount_columns=_amt)
+                            save_marked_workbooks(_files, _dir, masked=_masked)
+                            _made["masked" if _masked else "normal"] = zip_workbooks(_files)
+                        st.session_state["export_zips"] = _made
+                    _zips = st.session_state.get("export_zips")
+                    if _zips:
+                        _e1, _e2 = st.columns(2)
+                        _e1.download_button("📦 표시된 엑셀 (ZIP)", data=_zips["normal"],
+                                            file_name=f"datamedic_marked_{_state.get('run_id', '')}.zip",
+                                            mime="application/zip", key="dl_marked")
+                        _e2.download_button("🎤 발표용 마스킹 엑셀 (ZIP)", data=_zips["masked"],
+                                            file_name=f"datamedic_marked_masked_{_state.get('run_id', '')}.zip",
+                                            mime="application/zip", key="dl_marked_masked")
+                st.divider()
 
             if _report:
                 _r1, _r2, _r3, _r4 = st.columns(4)
@@ -800,33 +959,14 @@ with st.container():
 
             _requests = _state.get("requests", [])
             if _requests:
-                st.subheader("보완 요청 메일")
-                for _ridx, _req in enumerate(_requests):
-                    with st.expander(
-                        f"{'✅' if _req.sent else '📧'} {_req.org} — {_req.subject}",
-                        expanded=not _req.sent,
-                    ):
-                        _new_to   = st.text_input("수신자", value=_req.to or "", key=f"rto_{_ridx}")
-                        _new_subj = st.text_input("제목",   value=_req.subject, key=f"rsj_{_ridx}")
-                        _new_body = st.text_area("본문",    value=_req.body, height=200, key=f"rbd_{_ridx}")
-                        if _req.sent:
-                            st.success("발송 완료")
-                        else:
-                            if st.button(f"✉️ {_req.org} 발송", key=f"send_{_ridx}"):
-                                from notify.mailer import send_request
-                                _run_dir = settings.outputs_dir / (_state.get("run_id") or "unknown")
-                                _sent = send_request(
-                                    _req.model_copy(update={
-                                        "to": _new_to or None,
-                                        "subject": _new_subj,
-                                        "body": _new_body,
-                                    }),
-                                    _run_dir,
-                                )
-                                _new_reqs = list(_requests)
-                                _new_reqs[_ridx] = _sent
-                                st.session_state.state = {**_state, "requests": _new_reqs}
-                                st.rerun()
+                from ui.components.mail_panel import render_mail_panel
+                render_mail_panel(
+                    _requests,
+                    run_dir=settings.outputs_dir / (_state.get("run_id") or "unknown"),
+                    key="reqmail", title="보완 요청 메일",
+                    on_update=lambda _all: st.session_state.__setitem__(
+                        "state", {**(st.session_state.state or {}), "requests": _all}),
+                )
 
             _run_id  = _state.get("run_id", "")
             _run_dir = settings.outputs_dir / _run_id

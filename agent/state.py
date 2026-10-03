@@ -16,14 +16,16 @@ class GraphState(TypedDict, total=False):
     input_paths: list[str]        # 처리할 파일 경로 목록
     goal: str                     # 사용자가 입력한 진단 목표 (LLM 컨텍스트로 전달)
 
-    # [plan 노드가 채움 — docs/planner_design.md]
+    # [plan 노드가 채움]
     plan: Plan                    # 목표 해석 결과. 있으면 모든 노드가 이 범위 밖을 실행하지 않는다
     plan_choices: list[str]       # 되묻기에 대한 사용자 선택 (capability ID)
 
     # [aggregate 단계 — 집계 규칙 R5~R7]
-    agg_queue: list[str]          # 실행 대기 중인 집계 능력 (sum_limit, aggregate_view)
+    agg_queue: list[str]          # 실행 대기 중인 집계 능력 (sum_limit, count_limit, near_duplicate)
     query: dict                   # 진행 중인 집계 질문 상태 (query.QueryState)
     agg_results: list[dict]       # [{capability, skipped, spec, group_issues, response_text}]
+    agg_dispositions: dict        # 집계 위반 묶음의 처리 {"<검사>:<묶음 ID>": "request"|"ok"} — 없으면 기본 request
+    aggregate_basis: str          # 집계를 마지막으로 실행했을 때의 담당자 결정 버전 (engine.decisions.decision_version)
 
     # [레거시 — plan 이 없는 CLI 파이프라인 전용]
     rule_priorities: list[str]

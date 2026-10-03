@@ -21,7 +21,7 @@ def recheck_node(state: GraphState) -> GraphState:
       2. 잔여 오류 중 request 티어를 모아 기관별로 보완 요청 메일 생성 (LLM)
       3. 통계 집계 → RunReport 생성
       4. outputs/<run_id>/ 하위에 cleaned xlsx, changelog, issues, report 저장
-      5. notify.mailer로 보완 요청 메일 발송 (dry-run 포함)
+      5. notify.mailer로 보완 요청 메일 초안 저장 (발송은 화면에서 담당자가 직접)
     """
     cleaned = state.get("cleaned") or state["dataset"]
     bindings = state["bindings"]
@@ -40,15 +40,25 @@ def recheck_node(state: GraphState) -> GraphState:
 
     # 잔여 오류 중 request 티어 → 기관별로 보완 요청 생성
     from engine.masking import mask_issues
-    request_issues = mask_issues([i for i in remaining if i.tier == "request"])   # 메일·LLM 프롬프트용
+    # 담당자가 '확인 요청'으로 결정한 항목(승인 등급이어도)은 같은 셀의 잔여 오류를 보완 요청에 포함한다
+    request_cells = {(i.ref.file, i.ref.sheet, i.ref.row, i.ref.column) for i in issues_orig
+                     if i.ref and any(d.issue_id == i.issue_id and d.action == "request"
+                                      for d in state.get("decisions", []))}
+    request_issues = mask_issues([
+        i for i in remaining
+        if i.tier == "request" or (i.ref and (i.ref.file, i.ref.sheet, i.ref.row, i.ref.column) in request_cells)
+    ])   # 메일·LLM 프롬프트용
     org_issues: dict[str, list] = defaultdict(list)
     for i in request_issues:
         org = i.ref.file if i.ref else "unknown"
         org_issues[org].append(i)
 
+    from notify.contacts import load_contacts, resolve_recipient
+    contacts = load_contacts()                       # 기관명 → 담당자 메일 (data/standard/org_contacts.csv)
     requests: list[RequestItem] = []
     for org, org_i in org_issues.items():
         mail_body = ""
+        to = resolve_recipient(org, state.get("dataset"), contacts)
         try:
             from llm.client import complete_json
             from pydantic import BaseModel
@@ -67,13 +77,13 @@ def recheck_node(state: GraphState) -> GraphState:
             )
             requests.append(RequestItem(
                 org=org, issues=[i.issue_id for i in org_i],
-                subject=resp.subject, body=resp.body,
+                subject=resp.subject, body=resp.body, to=to,
             ))
         except Exception:
             requests.append(RequestItem(
                 org=org, issues=[i.issue_id for i in org_i],
                 subject=f"[데이터 보완 요청] {org}",
-                body="\n".join(f"- {i.message}" for i in org_i),
+                body="\n".join(f"- {i.message}" for i in org_i), to=to,
             ))
 
     # 통계
@@ -97,7 +107,7 @@ def recheck_node(state: GraphState) -> GraphState:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     changes_list = state.get("changes", [])
-    exporter.save_cleaned(cleaned, run_dir)
+    exporter.save_cleaned(cleaned, run_dir, original=state.get("dataset"), input_paths=state.get("input_paths"))
     exporter.save_highlighted(cleaned, issues_orig, changes_list, run_dir)
     exporter.save_changelog(changes_list, run_dir)
     exporter.save_issues(issues_orig, run_dir)
@@ -114,9 +124,10 @@ def recheck_node(state: GraphState) -> GraphState:
             json.dumps(req.model_dump(), ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-    # 메일 발송 (dry-run 포함)
-    from notify.mailer import send_all
-    requests = send_all(requests, run_dir)
+    # 메일은 초안으로 저장만 한다 — 실제 발송은 담당자가 화면에서 직접 누를 때만 일어난다
+    # (수신자가 주소록에서 자동으로 채워지므로, 여기서 발송하면 검토 없이 메일이 나가 버린다)
+    from notify.mailer import save_drafts
+    requests = save_drafts(requests, run_dir)
 
     loop_count = state.get("loop_count", 0) + 1
     logger.info("재검진 완료 — 잔여 오류: %d건, passed=%s, loop=%d", len(remaining), passed, loop_count)

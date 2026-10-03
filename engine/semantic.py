@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from engine.models import ColumnProfile, RuleBinding, SemanticType, SheetProfile
 
-# MVP 활성 규칙: BLANK / AMOUNT_NORMALIZE / DATE_NORMALIZE / BIZNO_VERIFY (RULES.md)
+# MVP 활성 규칙: BLANK / AMOUNT_NORMALIZE / DATE_NORMALIZE / BIZNO_VERIFY
 # 나머지 규칙(DATE_FORMAT, NUMERIC_UNIT, BIZNO_CHECKSUM, PHONE_FORMAT, … )은
 # validator.py가 이 모듈들을 로드하지 않으므로 REGISTRY에 등록되지 않는다.
 

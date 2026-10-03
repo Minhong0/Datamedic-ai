@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pandas as pd
 
+from engine.json_io import split_arrays, to_frame
 from engine.models import Dataset
+
+logger = logging.getLogger(__name__)
 
 
 _EXCEL_EPOCH = pd.Timestamp("1899-12-30")
@@ -52,27 +56,13 @@ def _load_xlsx(path: Path) -> dict[str, pd.DataFrame]:
 
 
 def _load_json(path: Path) -> dict[str, pd.DataFrame]:
+    """JSON → 시트(객체 배열)별 표. 객체 배열이 아닌 부분은 표로 만들지 않고 건너뛴다 (안내는 json_io.unsupported_notes)."""
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
-
-    if isinstance(data, list):
-        arrays = {"root": data}
-    elif isinstance(data, dict):
-        arrays = {
-            k: v for k, v in data.items() if isinstance(v, list)
-        }
-        if not arrays:
-            arrays = {"root": [data]}
-    else:
-        raise ValueError(f"지원하지 않는 JSON 구조: {path}")
-
-    result: dict[str, pd.DataFrame] = {}
-    for sheet, records in arrays.items():
-        df = pd.json_normalize(records).astype(str).fillna("")
-        df.insert(0, "_row", range(2, 2 + len(df)))
-        df["_row"] = df["_row"].astype(int)
-        result[sheet] = df
-    return result
+    layout = split_arrays(data)
+    for key, reason in layout.unsupported:
+        logger.warning("JSON 표시 불가: %s · %s: %s", path.name, key, reason)
+    return {sheet: to_frame(records) for sheet, records in layout.arrays.items()}
 
 
 def load_files(paths: list[str | Path]) -> Dataset:

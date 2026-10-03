@@ -14,6 +14,7 @@ from pathlib import Path
 import pandas as pd
 
 from engine.models import CellRef, Dataset, GroupIssue, Period, RuleSpec, Template, Tier
+from engine.rules.amount import normalize_amount
 from engine.rules.base import RuleContext
 
 logger = logging.getLogger(__name__)
@@ -78,7 +79,9 @@ def validate_spec(spec: RuleSpec) -> list[str]:
                 errors.append("date_window_days는 정수여야 합니다")
 
     elif spec.template == "SUM_LIMIT":
-        if "max_amount" in p:
+        if p.get("max_amount") is None:
+            errors.append("한도 금액을 숫자로 알려주세요 (예: 6천만원)")   # 비면 run_sum_limit이 조용히 0건을 낸다
+        else:
             try:
                 v = int(p["max_amount"])
                 if v < 0:
@@ -173,16 +176,30 @@ def _build_merged_df(ds: Dataset, sheet: str = "실적") -> pd.DataFrame:
             frames.append(tmp)
     if not frames:
         return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+    merged = pd.concat(frames, ignore_index=True)
+    if "사업자번호" in merged.columns:
+        merged["사업자번호"] = merged["사업자번호"].map(_group_bizno)
+    return merged
+
+
+def _group_bizno(value: object) -> object:
+    """집계 묶음 키용 사업자번호 — 하이픈 유무가 달라도 같은 기업으로 묶는다 (읽기 전용 복사본에서만 적용).
+
+    숫자 10자리면 'XXX-XX-XXXXX'로 맞추고, 그 외(자릿수 오류·빈 값)는 그대로 둔다.
+    """
+    digits = "".join(ch for ch in str(value) if ch.isdigit())
+    return f"{digits[:3]}-{digits[3:5]}-{digits[5:]}" if len(digits) == 10 else value
 
 
 def _add_year_col(df: pd.DataFrame, date_col: str = "지원일자") -> pd.DataFrame:
-    """지원일자에서 연도 컬럼(_year)을 추가한 복사본을 반환."""
+    """지원일자에서 연도 컬럼(_year)을 추가한 복사본을 반환.
+
+    '2026-04-05'뿐 아니라 정규화 전 표기('4/5/2026', '20260405')에서도 4자리 연도를 읽는다 — 앞 4글자를 그대로 쓰면
+    정규화되지 않은 날짜가 다른 연도 묶음으로 갈려 같은 기업의 횟수·합계 초과가 조용히 누락된다.
+    """
     df = df.copy()
     if date_col in df.columns:
-        df["_year"] = df[date_col].astype(str).str[:4].where(
-            df[date_col].astype(str).str.len() >= 4, other=pd.NA
-        )
+        df["_year"] = df[date_col].astype(str).str.extract(r"(?<!\d)(\d{4})(?:\d{4})?(?!\d)")[0]
     else:
         df["_year"] = pd.NA
     return df
@@ -194,6 +211,19 @@ def _effective_group(spec: RuleSpec, df: pd.DataFrame) -> list[str]:
     if spec.period == "year" and "_year" in df.columns:
         cols = cols + ["_year"]
     return cols
+
+
+def _parse_amount(v: object) -> float | None:
+    """집계용 금액 해석 (읽기 전용 — 셀은 바꾸지 않는다).
+
+    '7402만원', '165,020,000원'처럼 정규화 전 표기도 R2 normalize_amount로 읽는다.
+    해석할 수 없으면 None.
+    """
+    text = str(v).strip()
+    if not text or text.lower() in ("nan", "none"):
+        return None
+    res = normalize_amount(text)
+    return float(res.value) if res.value is not None else None
 
 
 def _group_key_dict(cols: list[str], vals: tuple) -> dict[str, str]:
@@ -362,11 +392,7 @@ def run_near_duplicate(ds: Dataset, spec: RuleSpec, ctx: RuleContext) -> list[Gr
         amounts: list[float | None] = []
         if has_amount:
             for _, r in rows_list:
-                try:
-                    v = float(str(r["지원금액"]).replace(",", "").strip() or "nan")
-                    amounts.append(v if not pd.isna(v) else None)
-                except (ValueError, TypeError):
-                    amounts.append(None)
+                amounts.append(_parse_amount(r["지원금액"]))
         else:
             amounts = [None] * n
 
@@ -467,7 +493,10 @@ def run_sum_limit(ds: Dataset, spec: RuleSpec, ctx: RuleContext) -> list[GroupIs
     scope = p.get("scope", "per_business")
     df = _add_year_col(df)
     df = df.copy()
-    df["_amount_num"] = pd.to_numeric(df[sum_col], errors="coerce")
+    df["_amount_num"] = df[sum_col].map(_parse_amount)   # 정규화 전 표기('7402만원' 등)도 합산한다
+    unreadable = df[df["_amount_num"].isna() & df[sum_col].astype(str).str.strip().ne("")]
+    if not unreadable.empty:
+        logger.warning("한도 검사에서 금액을 해석하지 못해 제외한 행: %s", sorted(unreadable["_row"].tolist()))
 
     if scope == "per_business":
         # group_by에 사업명이 없으면 추가 (사업별 합계)

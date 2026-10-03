@@ -1,4 +1,4 @@
-"""국세청 사업자등록정보 상태조회 클라이언트 (RULES.md R4-3 ~ R4-4).
+"""국세청 사업자등록정보 상태조회 클라이언트.
 
 NTS_MODE 환경변수(config.nts_mode) 에 따라 동작:
   mock — 실제 서버와 같은 요청·응답 형식의 모의 서버(nts_mock_server)를 호출한다.
@@ -74,7 +74,7 @@ class StatusProvider(Protocol):
 # ── OffProvider ────────────────────────────────────────────────────────────────
 
 class OffProvider:
-    """NTS_MODE=off: API 조회 건너뜀. bizno.py는 NTS 관련 Issue를 생성하지 않는다 (RULES.md R4-4)."""
+    """NTS_MODE=off: API 조회 건너뜀. bizno.py는 NTS 관련 Issue를 생성하지 않는다."""
     disabled: bool = True
 
     def query(self, bizno_list: list[str]) -> dict[str, NtsRecord]:

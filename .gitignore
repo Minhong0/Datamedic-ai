@@ -14,6 +14,7 @@ data/standard/org_contacts.csv
 *.csv
 !data/standard/business_codes.csv
 !data/standard/business_master.csv
+!data/standard/org_contacts.example.csv
 
 # 기타
 __pycache__/

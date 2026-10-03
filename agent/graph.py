@@ -22,7 +22,7 @@ from langgraph.types import interrupt
 from agent.state import GraphState
 from agent.nodes.aggregate import (
     agg_clarify_node, agg_confirm_node, agg_execute_node, agg_translate_node,
-    route_after_execute, route_after_translate,
+    route_after_confirm, route_after_execute, route_after_translate,
 )
 from agent.nodes.plan import plan_node
 from agent.nodes.planner import planner_node
@@ -175,7 +175,8 @@ def build_react_graph():
                             {"agg_clarify": "agg_clarify", "agg_confirm": "agg_confirm",
                              "agg_execute": "agg_execute"})
     g.add_edge("agg_clarify", "agg_translate")
-    g.add_edge("agg_confirm", "agg_execute")
+    g.add_conditional_edges("agg_confirm", route_after_confirm,
+                            {"agg_translate": "agg_translate", "agg_execute": "agg_execute"})
     g.add_conditional_edges("agg_execute", route_after_execute,
                             {"agg_translate": "agg_translate", "planner": "planner"})
     for node in ("analyze", "diagnose", "treatment", "ask_approval", "recheck"):

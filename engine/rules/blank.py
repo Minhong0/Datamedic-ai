@@ -1,4 +1,4 @@
-"""R1. BLANK — 공백 여부 탐지 및 공백 정규화 (RULES.md R1)."""
+"""R1. BLANK — 공백 여부 탐지 및 공백 정규화."""
 from __future__ import annotations
 
 import re

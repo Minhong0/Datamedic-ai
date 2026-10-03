@@ -7,6 +7,7 @@ import pandas as pd
 
 from engine.models import CellRef, Dataset, Issue, RuleBinding
 from engine.rules.base import NotFixable, Rule, RuleContext, register
+from engine.rules.bizno import bizno_checksum_ok
 from engine.rules.format_rules import _iter_column
 
 
@@ -84,15 +85,7 @@ class DateRangeRule(Rule):
 
 # ── BIZNO_CHECKSUM ────────────────────────────────────────────────────────────
 
-_BIZNO_WEIGHTS = [1, 3, 7, 1, 3, 7, 1, 3, 5]
-
-
-def _bizno_valid(digits: str) -> bool:
-    if len(digits) != 10 or not digits.isdigit():
-        return False
-    total = sum(int(digits[i]) * _BIZNO_WEIGHTS[i] for i in range(9))
-    check = (10 - (total % 10)) % 10
-    return check == int(digits[9])
+_bizno_valid = bizno_checksum_ok   # 체크디지트 로직은 bizno.py 한 곳에서만 관리
 
 
 def _bizno_digits(value: str) -> str:

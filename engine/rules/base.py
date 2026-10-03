@@ -13,7 +13,7 @@ class NotFixable(Exception):
 
 @dataclass
 class NormResult:
-    """정규화 함수의 표준 반환형 (RULES.md 0절 4항).
+    """정규화 함수의 표준 반환형.
 
     value=None 이면 정규화 실패.
     certain=True → auto tier, False → approval tier.

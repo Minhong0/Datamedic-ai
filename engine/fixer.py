@@ -11,11 +11,32 @@ import importlib
 from datetime import datetime, timezone
 
 from engine.models import Change, Dataset, Decision, Issue, Tier
-from engine.rules.base import REGISTRY, NotFixable
+from engine.rules.base import REGISTRY, NotFixable, Rule
 
 # 규칙 모듈 등록 (rule.fix() 메서드를 사용하기 위해)
 for _mod in ("format_rules", "value_rules", "row_rules", "table_rules", "json_rules"):
     importlib.import_module(f"engine.rules.{_mod}")
+
+
+def validate_edit(issue: Issue, value: str) -> tuple[str | None, str | None]:
+    """담당자가 직접 입력한 값을 해당 규칙으로 검증한다. 반환: (저장할 값, 오류 문구).
+
+    규칙이 값을 해석할 수 있으면 규칙의 표준 형식으로 돌려주고(예: '1,713만원' → '17130000'), 해석할 수 없으면 오류를 돌려준다.
+    값을 검증할 규칙(fix)이 없는 항목은 입력 그대로 받는다. 값 변경은 이 값을 Decision(edit)에 담아 apply()가 한다.
+    """
+    import engine.validator  # noqa: F401  (규칙 모듈 등록)
+
+    text = (value or "").strip()
+    if not text:
+        return None, "값을 입력해 주세요."
+    rule_cls = REGISTRY.get(issue.rule_id)
+    if rule_cls is None or rule_cls.fix is Rule.fix:
+        return text, None                       # 이 규칙은 값을 검증할 수 없다 — 입력 그대로 받는다
+    try:
+        fixed = rule_cls().fix(text, issue)
+    except NotFixable:
+        return None, f"입력한 값 '{text}'을(를) 이 항목의 형식({issue.rule_id})으로 해석할 수 없습니다."
+    return (fixed, None) if fixed else (None, "값을 해석할 수 없습니다.")
 
 
 def _next_change_id(counter: list[int]) -> str:

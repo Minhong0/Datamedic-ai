@@ -1,4 +1,4 @@
-"""R2. AMOUNT_NORMALIZE — 지원금액 정규화 (RULES.md R2)."""
+"""R2. AMOUNT_NORMALIZE — 지원금액 정규화."""
 from __future__ import annotations
 
 import re
@@ -65,6 +65,28 @@ def normalize_amount(raw: str, header_unit: str | None = None) -> NormResult:
     return NormResult(None, False, "금액으로 해석할 수 없는 값")
 
 
+def _parse_small(seg: str) -> float | None:
+    """억·만 구간 안의 값을 해석한다. 예: "6천" → 6000, "5천 5백" → 5500, "7,132" → 7132, "천" → 1000."""
+    rem = re.sub(r"[,_\s]", "", seg)
+    if not rem:
+        return None
+    total = 0.0
+    for unit, mult in [("천", 1000), ("백", 100), ("십", 10)]:
+        m = re.search(rf"([\d.]*){unit}", rem)
+        if m:
+            try:
+                total += (float(m.group(1)) if m.group(1) else 1.0) * mult
+            except ValueError:
+                return None
+            rem = rem[: m.start()] + rem[m.end():]
+    if rem:
+        try:
+            total += float(rem)
+        except ValueError:
+            return None
+    return total
+
+
 def _parse_mixed(v: str) -> float | None:
     """혼합 단위 금액 문자열을 파싱해 원 단위 숫자를 반환.
 
@@ -85,27 +107,26 @@ def _parse_mixed(v: str) -> float | None:
         except ValueError:
             pass
 
-    # 혼합 단위 파싱
+    # 혼합 단위 파싱: 억·만 구간을 먼저 떼고, 구간 안의 천·백·십("6천만" = 6천 × 만)을 해석한다
     total = 0.0
     remainder = s
-    for unit, mult in [("억", 100_000_000), ("만", 10_000), ("천", 1_000)]:
-        m = re.search(rf"([\d,_.]+)\s*{unit}", remainder)
+    for unit, mult in [("억", 100_000_000), ("만", 10_000)]:
+        m = re.search(rf"([\d,_.\s천백십]+?)\s*{unit}", remainder)
         if m:
-            num_str = m.group(1).replace(",", "").replace("_", "")
-            try:
-                total += float(num_str) * mult
-            except ValueError:
+            seg = _parse_small(m.group(1))
+            if seg is None:
                 return None
+            total += seg * mult
             remainder = remainder[: m.start()] + remainder[m.end():]
 
-    # 나머지 ('원' 접미사 제거 후 순수 숫자만 남아야 함)
-    remainder = re.sub(r"원$", "", remainder).replace(",", "").replace(" ", "").strip()
+    # 나머지 ('원' 접미사 제거 후 천·백·십 단위와 숫자만 남아야 함)
+    remainder = re.sub(r"원$", "", remainder.strip()).strip()
     if remainder:
-        try:
-            total += float(remainder)
-        except ValueError:
+        rest = _parse_small(remainder)
+        if rest is None:
             # 파싱할 수 없는 잔여 텍스트가 있으면 전체를 신뢰할 수 없다 ("약", "미정" 등)
             return None
+        total += rest
 
     return total if (total != 0.0 or s.startswith("0")) else None
 

@@ -23,11 +23,31 @@ def _ensure(path: Path) -> Path:
     return path
 
 
-def save_cleaned(ds: Dataset, run_dir: Path) -> None:
+def save_cleaned(ds: Dataset, run_dir: Path, *, original: Dataset | None = None,
+                 input_paths: list[str] | None = None) -> None:
+    """정제본 저장 — 엑셀은 엑셀로, JSON 은 **원래 JSON 형식**으로 쓴다.
+    JSON 은 원본 파일 경로(input_paths)와 원본 표(original)가 있어야 쓸 수 있다."""
+    import logging
+
+    from engine.json_io import apply_cleaned_to_json, is_json_file
+
     out_dir = _ensure(run_dir / "cleaned")
     written: dict[str, openpyxl.Workbook] = {}
+    paths = {Path(p).name: p for p in (input_paths or [])}
+
+    for file in sorted({f for f, _ in ds.tables if is_json_file(f)}):
+        src = paths.get(file)
+        if src is None or original is None:
+            logging.getLogger(__name__).warning("JSON 정제본을 쓰려면 원본 경로와 원본 표가 필요합니다: %s", file)
+            continue
+        sheets = [sh for f, sh in ds.tables if f == file]
+        (out_dir / file).write_bytes(apply_cleaned_to_json(
+            src, {sh: original.tables[(file, sh)] for sh in sheets if (file, sh) in original.tables},
+            {sh: ds.tables[(file, sh)] for sh in sheets}))
 
     for (file, sheet), df in ds.tables.items():
+        if is_json_file(file):
+            continue
         if file not in written:
             written[file] = openpyxl.Workbook()
             written[file].remove(written[file].active)  # 기본 시트 제거
@@ -44,7 +64,7 @@ def save_cleaned(ds: Dataset, run_dir: Path) -> None:
 
 def save_changelog(changes: list[Change], run_dir: Path) -> None:
     from engine.masking import mask_changes
-    changes = mask_changes(changes)   # 사업자번호 표시 마스킹 (RULES.md 0절 6항)
+    changes = mask_changes(changes)   # 사업자번호 표시 마스킹
     path = run_dir / "changelog.csv"
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=[
@@ -130,6 +150,8 @@ def save_highlighted(
 
     written: dict[str, openpyxl.Workbook] = {}
     for (file, sheet), df in ds.tables.items():
+        if str(file).lower().endswith(".json"):
+            continue                       # JSON 은 하이라이트 엑셀을 만들지 않는다 (변경 이력 CSV·결과 화면에서 확인)
         if file not in written:
             written[file] = openpyxl.Workbook()
             written[file].remove(written[file].active)

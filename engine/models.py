@@ -112,7 +112,7 @@ class PlanStep(BaseModel):
     reason: str
 
 
-# 목표 → 실행 계획. rule 범위 가드의 유일한 기준 (docs/planner_design.md)
+# 목표 → 실행 계획. rule 범위 가드의 유일한 기준
 class Plan(BaseModel):
     goal: str
     status: Literal["ready", "needs_clarification"]
@@ -120,6 +120,7 @@ class Plan(BaseModel):
     question: str | None = None                           # needs_clarification 일 때 되묻는 말
     options: list[dict] = []                              # [{"id": capability, "label": str}]
     delete_intent: bool = False                           # 목표에 제거·삭제 의도가 있는지
+    unhandled: list[str] = []                             # 목표에서 해석하지 못해 검사하지 않는 조항 (조용히 버리지 않고 알린다)
     source: Literal["llm", "keyword", "full", "user"] = "keyword"
 
 

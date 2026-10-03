@@ -14,6 +14,3 @@ sheets:
       - {name: 사업코드,     type: code,   required: true}
       - {name: 지원건수,     type: count,  required: true}
       - {name: 지원금액합계, type: amount, required: true}
-relations:
-  - {rule: SUM_MATCH, source: 실적.지원금액, group_by: 사업코드, agg: sum,   target: 요약.지원금액합계}
-  - {rule: SUM_MATCH, source: 실적.사업코드, group_by: 사업코드, agg: count, target: 요약.지원건수}

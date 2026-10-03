@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     openai_api_key: str = ""
     odcloud_api_key: str = ""     # data.go.kr 국세청 사업자번호 조회 API 키 (Decoding 키)
-    nts_mode: str = "mock"        # live | mock | off  (RULES.md R4-4)
+    nts_mode: str = "mock"        # live | mock | off
     llm_model_claude: str = "claude-sonnet-4-6"
     llm_model_openai: str = "gpt-4o"
 

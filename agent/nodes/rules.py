@@ -48,7 +48,7 @@ def rules_node(state: GraphState) -> GraphState:
       1. bindings_from_profiles: 시맨틱 타입(date, biz_no 등)에 따라
          기본 규칙을 자동으로 연결 (semantic_default)
       2. _relations_from_standard: performance.yaml의 relations 섹션에서
-         시트 간 집계 검증 규칙(TABLE_SUM 등)을 추가 (standard)
+         시트 간 집계 검증 규칙(standard relations)을 추가 (standard)
     """
     profiles = state["profiles"]
     plan = state.get("plan")
@@ -90,8 +90,6 @@ def _bindings_from_plan(plan: Plan, profiles) -> list[RuleBinding]:
     use_nts = "bizno_api" in scope.capabilities
 
     candidates = bindings_from_profiles(profiles)
-    if "sum_match" in scope.capabilities:
-        candidates.extend(_relations_from_standard())
     if "duplicate_row" in scope.capabilities:
         candidates.append(RuleBinding(rule_id="DUPLICATE_ROW", targets=[], source="semantic_default"))
 

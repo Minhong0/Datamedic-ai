@@ -1,4 +1,4 @@
-"""R3. DATE_NORMALIZE — 지원일자 정규화 (RULES.md R3)."""
+"""R3. DATE_NORMALIZE — 지원일자 정규화."""
 from __future__ import annotations
 
 import re

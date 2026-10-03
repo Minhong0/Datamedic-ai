@@ -1,4 +1,4 @@
-"""plan 노드 — 목표를 실행 계획(Plan)으로 해석한다 (docs/planner_design.md).
+"""plan 노드 — 목표를 실행 계획(Plan)으로 해석한다.
 
 해석 순서: (목표 없음→기본 전체) → LLM → 키워드 → 되묻기.
 어떤 경우에도 해석 실패가 '전체 규칙 실행'으로 이어지지 않는다.
@@ -31,10 +31,16 @@ def _llm_select(goal: str) -> list[str]:
     return planning.sanitize_llm_selection(goal, resp.capabilities)
 
 
-def build_plan(goal: str, choices: list[str] | None = None) -> Plan:
-    """목표(+되묻기 선택) → Plan. LLM 호출은 실패해도 키워드 해석으로 대체된다."""
+def build_plan(goal: str, choices: list[str] | None = None, *, ask_unhandled: bool = True) -> Plan:
+    """목표(+되묻기 선택) → Plan. LLM 호출은 실패해도 키워드 해석으로 대체된다.
+
+    ask_unhandled=True 이면 해석하지 못한 조항을 건너뛰지 않고 어떻게 처리할지 되묻는다.
+    사용자가 "이 검사로 처리"를 고르면 그 검사가 계획에 들어가고, "제외"를 고르면 동의한 제외로 계획에 기록한다.
+    """
     goal = planning.sanitize_goal(goal)
-    choices = [c for c in (choices or []) if c in planning.BY_ID]
+    raw_choices = list(choices or [])
+    clause_caps, used, skipped = planning.parse_clause_choices(raw_choices)
+    choices = [c for c in raw_choices if c in planning.BY_ID] + clause_caps
 
     if not goal and not choices:
         return planning.resolve_plan(goal, planning.default_capabilities(), "full")
@@ -51,7 +57,7 @@ def build_plan(goal: str, choices: list[str] | None = None) -> Plan:
             selected = planning.keyword_select(goal)
             source = "keyword"
 
-    if choices:
+    if choices or skipped:
         selected = list(dict.fromkeys([*selected, *choices]))
         source = "user"
 
@@ -62,7 +68,13 @@ def build_plan(goal: str, choices: list[str] | None = None) -> Plan:
     if ambiguity is not None:
         return ambiguity
 
-    return planning.resolve_plan(goal, selected, source)
+    plan = planning.resolve_plan(goal, selected, source)
+    if ask_unhandled:
+        pending = [c for c in plan.unhandled if c not in used and c not in skipped]
+        if pending:
+            return planning.clarify_unhandled(goal, pending[0], len(pending))
+        plan.unhandled = [c for c in plan.unhandled if c in skipped]    # 사용자가 동의하고 제외한 조건만 남긴다
+    return plan
 
 
 def plan_node(state: GraphState) -> GraphState:
@@ -75,9 +87,12 @@ def plan_node(state: GraphState) -> GraphState:
                 logger.info("계획: %s(%s) — %s", s.status, s.label, s.reason)
     else:
         logger.info("계획: 되묻기 — %s", plan.question)
+    for c in plan.unhandled:
+        logger.warning("계획: 해석하지 못한 조항 — %s", c)
     out: GraphState = {**state, "plan": plan}
     if plan.status == "ready":
         from agent.nodes.aggregate import aggregate_capabilities
         out["agg_queue"] = aggregate_capabilities(plan)
         out["agg_results"] = []
+        out["agg_dispositions"] = {}
     return out

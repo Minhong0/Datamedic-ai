@@ -5,10 +5,10 @@ import importlib
 from engine.models import Dataset, Issue, RuleBinding
 from engine.rules.base import REGISTRY, RuleContext
 
-# MVP 규칙 모듈만 로드 (RULES.md R-01)
+# MVP 규칙 모듈만 로드
 # 구 규칙 모듈(format_rules, value_rules 등)은 로드하지 않으므로 REGISTRY에 등록되지 않는다
 # 목표 선택형 규칙(row_rules, table_rules)은 REGISTRY에 올리기만 하며,
-# 계획(Plan)에 의해 binding이 만들어진 경우에만 실행된다 (RULES.md 목표 선택형 규칙).
+# 계획(Plan)에 의해 binding이 만들어진 경우에만 실행된다.
 for _mod in ("blank", "amount", "date", "bizno", "row_rules", "table_rules"):
     importlib.import_module(f"engine.rules.{_mod}")
 

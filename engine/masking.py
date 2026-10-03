@@ -99,3 +99,48 @@ def mask_change(change):
 
 def mask_changes(changes: list) -> list:
     return [mask_change(c) for c in changes]
+
+
+# ── 기업명 마스킹 (뷰어·발표 화면용) ─────────────────────────────────────────────
+
+COMPANY_COLUMN = "수혜기업명"
+_CORP_MARKS = ("주식회사", "유한회사", "(주)", "(유)", "㈜", "㈲")
+
+
+def mask_company(name: str | None) -> str | None:
+    """기업명을 가린다 — 법인 표기((주)·주식회사 등)는 두고 상호는 첫 글자만 남긴다.
+
+    '가나다(주)' → '가○○(주)', '주식회사 한빛' → '주식회사 한○', 한 글자 상호는 '○'.
+    """
+    if not name:
+        return name
+    text = str(name)
+    marks = [m for m in _CORP_MARKS if m in text]
+    core = text
+    for m in marks:
+        core = core.replace(m, "\0")
+    parts = core.split("\0")
+    out = []
+    for p in parts:
+        s = p.strip()
+        if not s:
+            out.append(p)
+            continue
+        lead = p[: len(p) - len(p.lstrip())]
+        trail = p[len(p.rstrip()):]
+        out.append(lead + s[0] + "○" * (len(s) - 1) + trail if len(s) > 1 else lead + "○" + trail)
+    merged = out[0]
+    for m, rest in zip(marks, out[1:]):
+        merged += m + rest
+    return merged
+
+
+def mask_cell_value(column: str, value: str | None) -> str | None:
+    """열 이름에 맞는 마스킹 — 사업자번호 열·기업명 열·그 밖의 자유 텍스트. 화면·메모·툴팁용."""
+    if value is None:
+        return value
+    if column == BIZNO_COLUMN:
+        return _mask_cell_value(value)
+    if column == COMPANY_COLUMN:
+        return mask_company(value)
+    return mask_text(value)

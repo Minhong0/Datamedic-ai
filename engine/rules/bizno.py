@@ -1,4 +1,4 @@
-"""R4. BIZNO_VERIFY — 사업자번호 형식·체크디지트·국세청 상태조회 (RULES.md R4)."""
+"""R4. BIZNO_VERIFY — 사업자번호 형식·체크디지트·국세청 상태조회."""
 from __future__ import annotations
 
 import re
@@ -18,7 +18,7 @@ def extract_digits(bizno: str) -> str:
 
 
 def bizno_checksum_ok(d: str) -> bool:
-    """10자리 숫자 문자열의 체크디지트 검증 (RULES.md R4-2)."""
+    """10자리 숫자 문자열의 체크디지트 검증."""
     if len(d) != 10 or not d.isdigit():
         return False
     s = sum(int(d[i]) * _WEIGHTS[i] for i in range(9))
@@ -75,7 +75,7 @@ class BiznoVerifyRule(Rule):
         date_col: str | None = binding.params.get("date_col")
 
         # NTS provider: 테스트에서 _provider 파라미터로 주입, 없으면 config 기반 팩토리
-        # OffProvider(disabled=True)이면 NTS 조회 건너뜀 — RULES.md R4-4 "off" 모드
+        # OffProvider(disabled=True)이면 NTS 조회 건너뜀 ("off" 모드)
         provider = binding.params.get("_provider")
         if provider is None and binding.params.get("use_nts", True):
             try:
