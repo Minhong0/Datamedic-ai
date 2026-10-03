@@ -86,8 +86,7 @@ def prescription_node(state: GraphState) -> GraphState:
 
     cell_conflicting: set[str] = {k for k, v in cell_suggestions.items() if len(v) >= 2}
 
-    _TIER_ORDER: dict[Tier, int] = {"info": -1, "auto": 0, "approval": 1, "request": 2}
-    _TIER_UP: dict[Tier, Tier] = {"info": "info", "auto": "approval", "approval": "request", "request": "request"}
+    _TIER_UP: dict[Tier, Tier] = {"auto": "approval", "approval": "request", "request": "request"}
 
     updated: list[Issue] = []
     for issue in issues:
@@ -128,7 +127,7 @@ def prescription_node(state: GraphState) -> GraphState:
             recommendation: str
 
         from collections import Counter
-        actionable = [i for i in updated if i.tier != "info"]
+        actionable = updated
         rule_counts = Counter(i.rule_id for i in actionable)
         rule_summary = "\n".join(f"- {rule}: {cnt}건" for rule, cnt in rule_counts.most_common(5))
 

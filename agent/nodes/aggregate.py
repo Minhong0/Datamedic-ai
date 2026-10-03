@@ -67,7 +67,7 @@ def group_issue_rows(res: dict) -> list[dict]:
             "위치": locations or "-",
             "그룹": " / ".join(f"{k}: {mask_bizno(v) if k == '사업자번호' else v}"
                               for k, v in g.group_key.items()),
-            "행": len(g.rows), "지표": g.metric, "등급": g.tier,
+            "행": len(g.rows), "지표": g.metric,
         })
     return out
 

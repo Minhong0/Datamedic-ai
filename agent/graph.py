@@ -205,8 +205,7 @@ def _loop_back_node(state: GraphState) -> GraphState:
 
 def _route_after_recheck(state: GraphState) -> str:
     remaining = state.get("remaining_issue_list", [])
-    non_info = [i for i in remaining if i.tier != "info"]
-    if non_info and state.get("loop_count", 1) < _MAX_LOOPS:
+    if remaining and state.get("loop_count", 1) < _MAX_LOOPS:
         return "loop_back"
     return END
 
@@ -301,8 +300,6 @@ def run_cli(input_paths: list[str], auto_approve: bool = False) -> GraphState:
                 decisions.append(Decision(issue_id=issue.issue_id, action="apply", decided_by="system"))
             elif issue.tier == "approval":
                 decisions.append(Decision(issue_id=issue.issue_id, action="apply", decided_by="operator"))
-            elif issue.tier == "info":
-                decisions.append(Decision(issue_id=issue.issue_id, action="reject", decided_by="system"))
             else:
                 decisions.append(Decision(issue_id=issue.issue_id, action="request", decided_by="system"))
 

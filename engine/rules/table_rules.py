@@ -65,7 +65,7 @@ class TypeConsistencyRule(Rule):
 @register
 class OutlierRule(Rule):
     rule_id = "OUTLIER"
-    default_tier = "info"
+    default_tier = "request"
     scope = "table"
     kind = "outlier"  # type: ignore[assignment]
 
@@ -114,6 +114,6 @@ class OutlierRule(Rule):
                             rule_id=self.rule_id, kind="outlier",
                             value=raw,
                             message=msg,
-                            tier="info",
+                            tier="request",
                         ))
         return issues

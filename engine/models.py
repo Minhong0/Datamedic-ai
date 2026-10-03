@@ -16,8 +16,8 @@ SemanticType = Literal[
     "org_name", "biz_no", "date", "amount", "count",
     "phone", "email", "code", "text", "unknown"
 ]
-# 오류 처리 등급: auto=자동수정, approval=사람 승인 필요, request=원본 제공처에 요청, info=참고 정보(처리 없음)
-Tier = Literal["auto", "approval", "request", "info"]
+# 오류 처리 등급 (3단계): auto=코드가 확신해 자동 수정, approval=담당자 승인 필요, request=원본 제공처(기관)에 확인·보완 요청
+Tier = Literal["auto", "approval", "request"]
 ErrorKind = Literal["rule", "outlier"]
 
 
@@ -144,7 +144,7 @@ class RuleSpec(BaseModel):
     params: dict                              # 템플릿별 파라미터
     period: Period = "year"
     filter_business: str | None = None        # 특정 사업명으로 한정
-    tier: Tier = "approval"                   # 템플릿 기본값
+    tier: Tier = "request"                    # 집계 위반은 기관에 확인(소명)을 요청하는 것이 기본
     source: Literal["business_master", "user_query"] = "business_master"
     confirmed_by: str | None = None
 

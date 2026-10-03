@@ -31,7 +31,7 @@ class AgentDecision(BaseModel):
 
 
 def _make_all_decisions(state: GraphState) -> list[Decision]:
-    """auto/request/info 등급 오류에 대한 시스템 결정을 생성한다."""
+    """auto/request 등급 오류에 대한 시스템 결정을 생성한다 (approval 은 담당자가 결정)."""
     issues = state.get("issues", [])
     existing_ids = {d.issue_id for d in state.get("decisions", [])}
     decs: list[Decision] = list(state.get("decisions", []))
@@ -42,8 +42,6 @@ def _make_all_decisions(state: GraphState) -> list[Decision]:
             decs.append(Decision(issue_id=i.issue_id, action="apply", decided_by="system"))
         elif i.tier == "request":
             decs.append(Decision(issue_id=i.issue_id, action="request", decided_by="system"))
-        elif i.tier == "info":
-            decs.append(Decision(issue_id=i.issue_id, action="reject", decided_by="system"))
     return decs
 
 
@@ -80,9 +78,8 @@ def _fallback_decision(state: GraphState) -> AgentDecision:
     if phase == "aggregated":
         return AgentDecision(action="finalize", reason="재검진 및 결과를 저장합니다.")
     if phase == "finalized":
-        non_info = [i for i in remaining if i.tier != "info"]
-        if non_info and loop < 3:
-            return AgentDecision(action="run_diagnosis", reason=f"잔여 오류 {len(non_info)}건을 재진단합니다.")
+        if remaining and loop < 3:
+            return AgentDecision(action="run_diagnosis", reason=f"잔여 오류 {len(remaining)}건을 재진단합니다.")
         return AgentDecision(action="done", reason="처리가 완료되었습니다.")
     return AgentDecision(action="done", reason="처리가 완료되었습니다.")
 
@@ -119,7 +116,7 @@ def _llm_decision(state: GraphState) -> AgentDecision:
             "agent_phase":      state.get("agent_phase", "init"),
             "file_count":       len(state.get("input_paths", [])),
             "issue_summary":    issue_summary,
-            "remaining_count":  len([i for i in remaining if i.tier != "info"]),
+            "remaining_count":  len(remaining),
             "last_action":      state.get("agent_action", "-"),
             "last_reason":      state.get("agent_reason", "-"),
             "agent_loop_count": state.get("agent_loop_count", 0),

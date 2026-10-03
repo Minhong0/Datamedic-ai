@@ -108,7 +108,7 @@ def _from_change(c: Change, decision: Decision | None, rule_id: str) -> MarkDeta
                       timestamp=c.timestamp)
 
 
-def _from_unchanged_issue(issue: Issue, decision: Decision | None, finalized: bool) -> MarkDetail | None:
+def _from_unchanged_issue(issue: Issue, decision: Decision | None, finalized: bool) -> MarkDetail:
     """Change 가 없는 Issue — 거절·확인 요청·결정 전(예정·승인 대기)·미결정."""
     col = issue.ref.column if issue.ref else ""
     before, proposed = _fmt(col, issue.value), _fmt(col, issue.suggestion) if issue.suggestion else None
@@ -123,8 +123,6 @@ def _from_unchanged_issue(issue: Issue, decision: Decision | None, finalized: bo
         return MarkDetail(status="request", after=None, decided_by=who,
                           reason=f"확인 요청 · {label} · 회신 대기", **base)
     # 여기부터는 아직 값이 바뀌지 않은 상태
-    if issue.tier == "info":
-        return None                                           # 참고 정보는 셀에 표시하지 않는다
     if issue.tier == "auto" and not finalized:
         return MarkDetail(status="auto_pending", after=proposed, decided_by=None,
                           reason=f"자동 수정 예정 · {label}: {before} → {proposed or '?'}", **base)
@@ -186,9 +184,8 @@ def build_marks(
     for i in issues:
         if i.ref is None or i.issue_id in changed_issue_ids:
             continue                                  # 테이블 단위 Issue 는 셀·행에 넣지 않는다
-        md = _from_unchanged_issue(i, dec.get(i.issue_id), finalized)
-        if md is not None:
-            details[(i.ref.file, i.ref.sheet, i.ref.row, i.ref.column)].append(md)
+        details[(i.ref.file, i.ref.sheet, i.ref.row, i.ref.column)].append(
+            _from_unchanged_issue(i, dec.get(i.issue_id), finalized))
 
     # 3) 집계 위반 묶음
     group_rows: dict[RowKey, list[str]] = defaultdict(list)

@@ -29,10 +29,18 @@ def load_contacts(path: Path | None = None) -> dict[str, str]:
     p = path or contacts_path()
     if not p.exists():
         return {}
-    try:
-        df = pd.read_csv(p, dtype=str, encoding="utf-8-sig").fillna("")
-    except (OSError, ValueError) as e:
-        logger.warning("주소록을 읽지 못했습니다: %s", e)
+    df = None
+    for encoding in ("utf-8-sig", "cp949"):          # 엑셀의 기본 'CSV' 저장은 CP949(한글 윈도우 기본)라서 함께 읽는다
+        try:
+            df = pd.read_csv(p, dtype=str, encoding=encoding).fillna("")
+            break
+        except UnicodeDecodeError:
+            continue
+        except (OSError, ValueError) as e:
+            logger.warning("주소록을 읽지 못했습니다: %s", e)
+            return {}
+    if df is None:
+        logger.warning("주소록의 문자 인코딩을 알 수 없습니다 (UTF-8 또는 CP949 로 저장해 주세요): %s", p)
         return {}
     if ORG_COLUMN not in df.columns or MAIL_COLUMN not in df.columns:
         logger.warning("주소록에 '%s', '%s' 열이 필요합니다: %s", ORG_COLUMN, MAIL_COLUMN, p)

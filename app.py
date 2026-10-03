@@ -210,7 +210,7 @@ def _proactive_summary(issues: list[Issue], n_files: int) -> str:
     auto_c = sum(1 for i in issues if i.tier == "auto")
     appr_c = sum(1 for i in issues if i.tier == "approval")
     req_c  = sum(1 for i in issues if i.tier == "request")
-    top    = Counter(i.rule_id for i in issues if i.tier != "info").most_common(1)
+    top    = Counter(i.rule_id for i in issues).most_common(1)
     top_str = f"\n주요 규칙: **{top[0][0]}** ({top[0][1]}건)" if top else ""
     if n == 0:
         return f"파일 **{n_files}개** 분석 완료 — 오류가 발견되지 않았습니다. 🎉"
@@ -685,7 +685,7 @@ with st.container():
         # 오류 상세
         if _issues:
             with st.expander("오류 상세 보기"):
-                _rule_c = pd.Series([i.rule_id for i in _issues if i.tier != "info"]).value_counts()
+                _rule_c = pd.Series([i.rule_id for i in _issues]).value_counts()
                 if not _rule_c.empty:
                     st.bar_chart(_rule_c)
                 _all_t = sorted({i.tier    for i in _issues})
@@ -854,7 +854,7 @@ with st.container():
                     _gi = _res.get("group_issues", [])
                     if _gi:
                         # 위반 묶음마다 처리 선택: 기본은 기관에 확인 요청, 확인해 보니 정상이면 '문제 없음'
-                        _df = pd.DataFrame(_agg_rows(_res)).drop(columns=["등급"])
+                        _df = pd.DataFrame(_agg_rows(_res))
                         _df.insert(0, "처리", [disposition_to_label(_stored_disp.get(issue_key(_res["capability"], _g)))
                                               for _g in _gi])
                         _edited = st.data_editor(

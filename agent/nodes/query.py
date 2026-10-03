@@ -490,9 +490,7 @@ def _translation_to_spec(t: TranslationResponse, spec_id: str | None = None) -> 
         params=params,
         period=t.period or "year",
         filter_business=t.filter_business,
-        tier={"MAX_COUNT": "approval", "NEAR_DUPLICATE": "approval", "SUM_LIMIT": "request"}.get(
-            t.template or "", "approval"
-        ),
+        tier="request",                 # 집계 위반은 모두 기관에 확인(소명)을 요청하는 것이 기본
         source="user_query",
     )
 

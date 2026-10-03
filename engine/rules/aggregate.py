@@ -126,7 +126,7 @@ def load_business_master(path: Path | str) -> list[RuleSpec]:
                     params={"count_distinct": "행", "max": annual},
                     period="year",
                     filter_business=biz_name,
-                    tier="approval",
+                    tier="request",
                     source="business_master",
                 ))
 
@@ -141,7 +141,7 @@ def load_business_master(path: Path | str) -> list[RuleSpec]:
                     params={"count_distinct": "행", "max": "1"},
                     period="year",
                     filter_business=biz_name,
-                    tier="approval",
+                    tier="request",
                     source="business_master",
                 ))
 
