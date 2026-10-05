@@ -1,0 +1,16 @@
+name: 시군_사업실적
+sheets:
+  실적:
+    columns:
+      - {name: 기관명,       type: org_name, required: true}
+      - {name: 사업코드,     type: code,     required: true, codebook: business_codes.csv}
+      - {name: 사업명,       type: text,     required: true}
+      - {name: 수혜기업명,   type: org_name, required: true}
+      - {name: 사업자번호,   type: biz_no,   required: true}
+      - {name: 지원일자,     type: date,     required: true, range: [2026-01-01, 2026-12-31]}
+      - {name: 지원금액,     type: amount,   required: true, unit: 원}
+  요약:
+    columns:
+      - {name: 사업코드,     type: code,   required: true}
+      - {name: 지원건수,     type: count,  required: true}
+      - {name: 지원금액합계, type: amount, required: true}

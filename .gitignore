@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+outputs/
+data/memory/
+data/standard/org_contacts.csv
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.venv*/
+*.egg-info/
