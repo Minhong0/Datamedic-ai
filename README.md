@@ -1,6 +1,6 @@
 # DataMedic AI
 
-지원금 지급 내역의 데이터 주치의 Agent — 지원금 지급 내역 데이터 주치의 AI Agent 
+DataMedic AI - 지원금 지급 내역 데이터 주치의 AI Agent
 
 제4회 경남 AI·SW 경진대회 출품작 (팀 거북이 · 업무혁신·생산성 향상 AI Agent)
 
